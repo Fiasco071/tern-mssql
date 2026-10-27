@@ -1,8 +1,12 @@
 //! SQL Server over tiberius, driven from a private current-thread runtime so
 //! the synchronous Tern SDK loop never sees async.
 
+use std::{future::poll_fn, pin::Pin};
+
 use anyhow::Context;
-use tiberius::{Client, ColumnData, Config};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use futures_core::Stream;
+use tiberius::{Client, ColumnData, Config, FromSql};
 use tokio::{net::TcpStream, runtime::Runtime};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -15,7 +19,7 @@ pub struct Mssql {
 }
 
 impl Mssql {
-	/// Connects with an ADO connection string (`server=tcp:host,1433;user id=...`).
+	/// Connects with an ADO connection string.
 	pub fn connect(ado: &str) -> anyhow::Result<Self> {
 		let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 		let config = Config::from_ado_string(ado).context("bad connection string")?;
@@ -29,7 +33,7 @@ impl Mssql {
 }
 
 /// One cell as display text; `None` is NULL.
-fn cell(data: &ColumnData<'_>) -> Option<String> {
+fn cell(data: &ColumnData<'static>) -> Option<String> {
 	use ColumnData as C;
 	match data {
 		C::U8(v) => v.map(|x| x.to_string()),
@@ -41,13 +45,43 @@ fn cell(data: &ColumnData<'_>) -> Option<String> {
 		C::Bit(v) => v.map(|x| x.to_string()),
 		C::String(v) => v.as_ref().map(|x| x.to_string()),
 		C::Guid(v) => v.map(|x| x.to_string()),
-		C::Binary(v) => v.as_ref().map(|b| format!("0x{}", b.iter().map(|x| format!("{x:02X}")).collect::<String>())),
+		C::Binary(v) => v
+			.as_ref()
+			.map(|b| format!("0x{}", b.iter().map(|x| format!("{x:02X}")).collect::<String>())),
 		C::Numeric(v) => v.map(|x| x.to_string()),
-		other => Some(format!("{other:?}")),
+		C::DateTime(_) | C::SmallDateTime(_) | C::DateTime2(_) => {
+			NaiveDateTime::from_sql(data).ok().flatten().map(|d| d.to_string())
+		},
+		C::Date(_) => NaiveDate::from_sql(data).ok().flatten().map(|d| d.to_string()),
+		C::Time(_) => NaiveTime::from_sql(data).ok().flatten().map(|d| d.to_string()),
+		C::DateTimeOffset(_) => {
+			DateTime::<FixedOffset>::from_sql(data).ok().flatten().map(|d| d.to_string())
+		},
+		C::Xml(v) => v.as_ref().map(|x| x.to_string()),
 	}
 }
 
+/// `StreamExt::next` without pulling in all of futures.
+async fn next<S: Stream + Unpin>(s: &mut S) -> Option<S::Item> {
+	poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
+}
+
 impl Backend for Mssql {
+	fn databases(&mut self) -> anyhow::Result<Vec<String>> {
+		let r = self.query("SELECT name FROM sys.databases WHERE state = 0 ORDER BY name", usize::MAX)?;
+		Ok(r.rows.into_iter().filter_map(|mut r| r.pop().flatten()).collect())
+	}
+
+	fn current(&mut self) -> anyhow::Result<String> {
+		let r = self.query("SELECT DB_NAME()", 1)?;
+		Ok(r.rows.into_iter().next().and_then(|mut r| r.pop().flatten()).unwrap_or_default())
+	}
+
+	fn use_database(&mut self, name: &str) -> anyhow::Result<()> {
+		self.query(&format!("USE [{}]", name.replace(']', "]]")), 0)?;
+		Ok(())
+	}
+
 	fn tables(&mut self) -> anyhow::Result<Vec<String>> {
 		let rows = self.query(
 			"SELECT TABLE_SCHEMA + '.' + TABLE_NAME FROM INFORMATION_SCHEMA.TABLES ORDER BY 1",
@@ -68,26 +102,15 @@ impl Backend for Mssql {
 			let mut rows = Vec::new();
 			let mut capped = false;
 			let mut it = stream.into_row_stream();
-			use tokio_stream_shim::next;
 			while let Some(row) = next(&mut it).await {
+				let row = row?;
 				if rows.len() >= limit {
 					capped = true;
 					break;
 				}
-				rows.push(row?.into_iter().map(|d| cell(&d)).collect());
+				rows.push(row.into_iter().map(|d| cell(&d)).collect());
 			}
 			Ok(Rows { columns, rows, capped })
 		})
-	}
-}
-
-/// `futures::StreamExt::next` without pulling in all of futures.
-mod tokio_stream_shim {
-	use std::{future::poll_fn, pin::Pin};
-
-	use futures_core::Stream;
-
-	pub async fn next<S: Stream + Unpin>(s: &mut S) -> Option<S::Item> {
-		poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
 	}
 }

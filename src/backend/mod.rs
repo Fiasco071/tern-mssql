@@ -1,5 +1,5 @@
 //! The database surface the UI talks to. Mirrors Tern's built-in SQLite API
-//! (`tables`, `schema`, `query` with a row cap) so other engines can slot in.
+//! (`tables`, `query` with a row cap) so other engines can slot in.
 
 pub mod mssql;
 
@@ -15,8 +15,14 @@ pub struct Rows {
 
 /// A connected database.
 pub trait Backend {
-	/// User tables and views as `schema.name`.
+	/// Online databases on the server.
+	fn databases(&mut self) -> anyhow::Result<Vec<String>>;
+	/// The database the connection is in.
+	fn current(&mut self) -> anyhow::Result<String>;
+	/// Switches the connection to `name`.
+	fn use_database(&mut self, name: &str) -> anyhow::Result<()>;
+	/// User tables and views of the current database as `schema.name`.
 	fn tables(&mut self) -> anyhow::Result<Vec<String>>;
-	/// Runs one statement and returns at most `limit` rows.
+	/// Runs one batch and returns at most `limit` rows.
 	fn query(&mut self, sql: &str, limit: usize) -> anyhow::Result<Rows>;
 }
