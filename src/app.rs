@@ -1,7 +1,7 @@
 //! The interactive client: an explorer tree, a results table and a query
 //! editor on one full-screen Tern surface.
 
-use std::time::Instant;
+use std::{path::PathBuf, time::{Duration, Instant}};
 
 use tern_sdk::{
 	Input, Options, Session, SurfaceOptions, nodes,
@@ -10,8 +10,9 @@ use tern_sdk::{
 };
 
 use crate::{
-	backend::{Backend, Rows},
+	backend::{Backend, Cancel, Rows},
 	guard,
+	worker::{Job, Reply, Worker},
 };
 
 /// Rows kept per result.
@@ -40,10 +41,24 @@ enum Shown {
 	Error(String),
 }
 
+/// The job the worker is running.
+struct Busy {
+	/// When it started.
+	since:  Instant,
+	/// What it is, for the status strip.
+	what:   &'static str,
+	/// Stops it.
+	cancel: Cancel,
+	/// Cancel was requested.
+	asked:  bool,
+}
+
 /// The client's state.
-struct App<B: Backend> {
-	/// The connection.
-	db:        B,
+struct App {
+	/// The database thread.
+	worker:    Worker,
+	/// The running job.
+	busy:      Option<Busy>,
 	/// Profile name, for the status strip.
 	profile:   String,
 	/// Databases on the server.
@@ -79,14 +94,15 @@ fn flat(cell: &str) -> String {
 	cell.replace(['\r', '\n'], " ")
 }
 
-impl<B: Backend> App<B> {
-	/// Loads the explorer.
-	fn new(mut db: B, profile: String) -> anyhow::Result<Self> {
+impl App {
+	/// Loads the explorer, then hands the connection to the worker thread.
+	fn new<B: Backend + Send + 'static>(mut db: B, profile: String) -> anyhow::Result<Self> {
 		let databases = db.databases()?;
 		let current = db.current()?;
 		let tables = db.tables()?;
 		Ok(Self {
-			db,
+			worker: Worker::spawn(db),
+			busy: None,
 			profile,
 			databases,
 			current,
@@ -190,52 +206,107 @@ impl<B: Backend> App<B> {
 		true
 	}
 
-	/// Runs the draft, honoring the read-only guard.
-	fn run(&mut self) {
+	/// Starts `job` unless one is running.
+	fn start(&mut self, job: Job, what: &'static str) {
+		if self.busy.is_some() {
+			self.note = "busy: esc cancels the running job".into();
+			return;
+		}
+		let cancel = self.worker.submit(job);
+		self.busy = Some(Busy { since: Instant::now(), what, cancel, asked: false });
+		self.note = format!("{what}... (esc cancels)");
+	}
+
+	/// The draft, if it may run: not empty and past the read-only guard.
+	fn runnable(&mut self) -> Option<String> {
 		let sql = self.draft.trim().to_owned();
 		if sql.is_empty() {
-			return;
+			return None;
 		}
 		if !self.write {
 			if let Some(word) = guard::check(&sql) {
 				self.shown = Shown::Error(format!(
 					"Read-only mode refused `{word}`. Press ctrl+w to allow writes."
 				));
-				return;
+				return None;
 			}
 		}
-		let started = Instant::now();
-		match self.db.query(&sql, LIMIT) {
-			Ok(rows) => {
-				self.note = format!(
-					"{} rows in {} ms{}",
-					rows.rows.len(),
-					started.elapsed().as_millis(),
-					if rows.capped { " (capped)" } else { "" }
-				);
-				self.shown = Shown::Rows(rows);
-			},
-			Err(e) => self.shown = Shown::Error(format!("{e:#}")),
+		Some(sql)
+	}
+
+	/// Runs the draft.
+	fn run(&mut self) {
+		if let Some(sql) = self.runnable() {
+			self.start(Job::Query { sql, limit: LIMIT }, "running");
 		}
 	}
 
-	/// Switches database and reloads the explorer.
-	fn switch(&mut self, name: &str) {
-		let result = self.db.use_database(name).and_then(|()| {
-			self.tables = self.db.tables()?;
-			self.current = name.to_owned();
-			Ok(())
-		});
-		if let Err(e) = result {
-			self.shown = Shown::Error(format!("{e:#}"));
+	/// Writes the draft's full result to a CSV file in the pane's directory.
+	fn export(&mut self) {
+		if let Some(sql) = self.runnable() {
+			let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+			let db: String = self
+				.current
+				.chars()
+				.map(|c| if c.is_alphanumeric() { c } else { '_' })
+				.collect();
+			let path = PathBuf::from(format!("tern-mssql-{db}-{stamp}.csv"));
+			self.start(Job::Export { sql, path }, "exporting");
 		}
+	}
+
+	/// Asks the running job to stop.
+	fn cancel(&mut self) {
+		if let Some(b) = self.busy.as_mut().filter(|b| !b.asked) {
+			b.cancel.cancel();
+			b.asked = true;
+			self.note = "cancelling...".into();
+		}
+	}
+
+	/// Takes the worker's reply, if the job finished. Returns whether anything changed.
+	fn poll(&mut self) -> bool {
+		let Some(reply) = self.worker.poll() else {
+			if let Some(b) = self.busy.as_ref().filter(|b| !b.asked) {
+				self.note = format!("{} {}s (esc cancels)", b.what, b.since.elapsed().as_secs());
+				return true;
+			}
+			return false;
+		};
+		let ms = self.busy.take().map_or(0, |b| b.since.elapsed().as_millis());
+		match reply {
+			Reply::Rows(Ok(rows), took) => {
+				self.note = format!(
+					"{} rows in {took} ms{}",
+					rows.rows.len(),
+					if rows.capped { " (capped, ctrl+e exports all)" } else { "" }
+				);
+				self.shown = Shown::Rows(rows);
+			},
+			Reply::Rows(Err(e), _) | Reply::Exported(Err(e)) => {
+				self.note.clear();
+				self.shown = Shown::Error(e);
+			},
+			Reply::Exported(Ok((path, n))) => {
+				let full = std::fs::canonicalize(&path).unwrap_or(path);
+				self.note = format!("{n} rows in {ms} ms to {}", full.display());
+			},
+			Reply::Switched(name, Ok(tables)) => {
+				self.current = name;
+				self.tables = tables;
+				self.note.clear();
+			},
+			Reply::Switched(_, Err(e)) => self.shown = Shown::Error(e),
+			Reply::Cancelled => self.note = "cancelled".into(),
+		}
+		true
 	}
 
 	/// A tree row was activated.
 	fn activate(&mut self, id: &str) {
 		if let Some(name) = id.strip_prefix("db:") {
 			if name != self.current {
-				self.switch(name);
+				self.start(Job::Switch(name.to_owned()), "switching");
 			}
 		} else if let Some(table) = id.strip_prefix("t:") {
 			self.set_draft(format!("SELECT TOP (100) * FROM {}", quoted(table)));
@@ -307,7 +378,7 @@ impl<B: Backend> App<B> {
 				.text(self.draft.clone())
 				.cursor(cursor)
 				.lang("sql")
-				.placeholder("SQL (F5 or ctrl+enter runs, tab switches pane, ctrl+q quits)")
+				.placeholder("SQL: F5 runs, ctrl+e exports CSV, esc cancels, tab switches pane, ctrl+q quits")
 				.on_focus(Msg::Focus),
 			ui::status()
 				.key("bar")
@@ -323,7 +394,7 @@ impl<B: Backend> App<B> {
 }
 
 /// Runs the client until the user quits.
-pub fn run<B: Backend>(db: B, profile: String) -> anyhow::Result<()> {
+pub fn run<B: Backend + Send + 'static>(db: B, profile: String) -> anyhow::Result<()> {
 	let Some(mut session) = Session::connect(Options::new().feature(feature::SEND))? else {
 		anyhow::bail!(
 			"interactive mode needs a terminal that speaks TSP (Tern); use `tern-mssql query` instead"
@@ -333,16 +404,29 @@ pub fn run<B: Backend>(db: B, profile: String) -> anyhow::Result<()> {
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server"))?;
 	session.render(sf, app.view())?;
 	session.focus(sf, Some(EDITOR))?;
-	while let Some(input) = session.next(None)? {
+	loop {
+		// Poll while a job runs so the clock ticks and its reply shows up; block when idle.
+		let wait = app.busy.is_some().then_some(Duration::from_millis(100));
+		let input = match session.next(wait) {
+			Ok(input) => input,
+			Err(tern_sdk::Error::InputClosed) => break,
+			Err(e) => return Err(e.into()),
+		};
+		if app.poll() && input.is_none() {
+			session.render(sf, app.view())?;
+		}
+		let Some(input) = input else { continue };
 		match input {
 			Input::Key(key) => {
 				if key.is("ctrl+q") || key.is("ctrl+c") {
 					break;
 				}
 				if key.is("f5") || (key.name == "enter" && key.ctrl) {
-					app.note = "running...".into();
-					session.render(sf, app.view())?;
 					app.run();
+				} else if key.is("ctrl+e") {
+					app.export();
+				} else if key.is("escape") || key.is("ctrl+x") {
+					app.cancel();
 				} else if key.is("ctrl+w") {
 					app.write = !app.write;
 				} else if key.name == "tab" {

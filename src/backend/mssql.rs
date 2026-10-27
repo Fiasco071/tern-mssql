@@ -10,25 +10,55 @@ use tiberius::{Client, ColumnData, Config, FromSql};
 use tokio::{net::TcpStream, runtime::Runtime};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use super::{Backend, Rows};
+use super::{Backend, Cancel, Outcome, Sink};
+
+/// The wire connection.
+type Conn = Client<Compat<TcpStream>>;
 
 /// A live connection plus the runtime that drives it.
 pub struct Mssql {
-	rt:     Runtime,
-	client: Client<Compat<TcpStream>>,
+	rt:       Runtime,
+	ado:      String,
+	/// The database the connection is in, restored after a reconnect.
+	database: Option<String>,
+	client:   Conn,
+}
+
+/// Opens a connection.
+async fn open(ado: &str) -> anyhow::Result<Conn> {
+	let config = Config::from_ado_string(ado).context("bad connection string")?;
+	let tcp = TcpStream::connect(config.get_addr()).await?;
+	tcp.set_nodelay(true)?;
+	Ok(Client::connect(config, tcp.compat_write()).await?)
+}
+
+/// `[name]` with `]` doubled.
+fn bracket(name: &str) -> String {
+	format!("[{}]", name.replace(']', "]]"))
 }
 
 impl Mssql {
 	/// Connects with an ADO connection string.
 	pub fn connect(ado: &str) -> anyhow::Result<Self> {
 		let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-		let config = Config::from_ado_string(ado).context("bad connection string")?;
-		let client = rt.block_on(async {
-			let tcp = TcpStream::connect(config.get_addr()).await?;
-			tcp.set_nodelay(true)?;
-			Ok::<_, anyhow::Error>(Client::connect(config, tcp.compat_write()).await?)
+		let client = rt.block_on(open(ado))?;
+		Ok(Self { rt, ado: ado.to_owned(), database: None, client })
+	}
+
+	/// Replaces the connection, which closes the old socket and so stops
+	/// whatever the server was running for it.
+	fn reconnect(&mut self) -> anyhow::Result<()> {
+		let ado = self.ado.clone();
+		let db = self.database.clone();
+		let fresh = self.rt.block_on(async {
+			let mut fresh = open(&ado).await?;
+			if let Some(db) = db {
+				fresh.simple_query(format!("USE {}", bracket(&db))).await?.into_results().await?;
+			}
+			anyhow::Ok(fresh)
 		})?;
-		Ok(Self { rt, client })
+		self.client = fresh;
+		Ok(())
 	}
 }
 
@@ -67,50 +97,38 @@ async fn next<S: Stream + Unpin>(s: &mut S) -> Option<S::Item> {
 }
 
 impl Backend for Mssql {
-	fn databases(&mut self) -> anyhow::Result<Vec<String>> {
-		let r = self.query("SELECT name FROM sys.databases WHERE state = 0 ORDER BY name", usize::MAX)?;
-		Ok(r.rows.into_iter().filter_map(|mut r| r.pop().flatten()).collect())
-	}
-
-	fn current(&mut self) -> anyhow::Result<String> {
-		let r = self.query("SELECT DB_NAME()", 1)?;
-		Ok(r.rows.into_iter().next().and_then(|mut r| r.pop().flatten()).unwrap_or_default())
-	}
-
 	fn use_database(&mut self, name: &str) -> anyhow::Result<()> {
-		self.query(&format!("USE [{}]", name.replace(']', "]]")), 0)?;
+		self.query(&format!("USE {}", bracket(name)), 0)?;
+		self.database = Some(name.to_owned());
 		Ok(())
 	}
 
-	fn tables(&mut self) -> anyhow::Result<Vec<String>> {
-		let rows = self.query(
-			"SELECT TABLE_SCHEMA + '.' + TABLE_NAME FROM INFORMATION_SCHEMA.TABLES ORDER BY 1",
-			usize::MAX,
-		)?;
-		Ok(rows.rows.into_iter().filter_map(|mut r| r.pop().flatten()).collect())
-	}
-
-	fn query(&mut self, sql: &str, limit: usize) -> anyhow::Result<Rows> {
+	fn stream(&mut self, sql: &str, cancel: &Cancel, sink: &mut dyn Sink) -> anyhow::Result<Outcome> {
 		let client = &mut self.client;
-		self.rt.block_on(async {
-			let mut stream = client.simple_query(sql).await?;
-			let columns = stream
-				.columns()
-				.await?
-				.map(|c| c.iter().map(|c| c.name().to_owned()).collect())
-				.unwrap_or_default();
-			let mut rows = Vec::new();
-			let mut capped = false;
-			let mut it = stream.into_row_stream();
-			while let Some(row) = next(&mut it).await {
-				let row = row?;
-				if rows.len() >= limit {
-					capped = true;
-					break;
+		let outcome = self.rt.block_on(async {
+			let run = async {
+				let mut stream = client.simple_query(sql).await?;
+				if let Some(cols) = stream.columns().await? {
+					let names: Vec<String> = cols.iter().map(|c| c.name().to_owned()).collect();
+					sink.columns(&names);
 				}
-				rows.push(row.into_iter().map(|d| cell(&d)).collect());
+				let mut rows = stream.into_row_stream();
+				while let Some(row) = next(&mut rows).await {
+					let row = row?;
+					if !sink.row(row.into_iter().map(|d| cell(&d)).collect()) {
+						break;
+					}
+				}
+				anyhow::Ok(())
+			};
+			tokio::select! {
+				r = run => r.map(|()| Outcome::Done),
+				() = cancel.cancelled() => anyhow::Ok(Outcome::Cancelled),
 			}
-			Ok(Rows { columns, rows, capped })
-		})
+		})?;
+		if matches!(outcome, Outcome::Cancelled) {
+			self.reconnect()?;
+		}
+		Ok(outcome)
 	}
 }

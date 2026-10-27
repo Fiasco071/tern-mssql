@@ -6,6 +6,7 @@ mod app;
 mod backend;
 mod guard;
 mod profile;
+mod worker;
 
 use anyhow::{Context, bail};
 use backend::{Backend, Rows, mssql::Mssql};
