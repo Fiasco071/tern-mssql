@@ -1,0 +1,7 @@
+schema = 1
+id = "mssql"
+name = "SQL Server"
+version = "0.1.0"
+description = "SQL Server client drawn as native Tern surfaces."
+icon = "database"
+window = "window.luau"

@@ -1,0 +1,21 @@
+[package]
+name = "tern-mssql"
+version = "0.1.0"
+edition = "2024"
+description = "A SQL Server client for Tern, drawn as native Tern surfaces."
+license = "MIT"
+
+[dependencies]
+tern-sdk = "0.1.0"
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "tds73"] }
+tokio = { version = "1", features = ["rt", "net"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+anyhow = "1"
+futures-core = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
