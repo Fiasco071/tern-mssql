@@ -5,6 +5,7 @@
 mod app;
 mod backend;
 mod catalog;
+mod clip;
 mod complete;
 mod guard;
 mod profile;

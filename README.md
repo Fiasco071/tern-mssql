@@ -14,7 +14,10 @@ Profiles live in `%APPDATA%\tern-mssql\profiles.json` (`~/.config/tern-mssql/pro
 
 - Explorer on the left, styled like Tern's file explorer: server, databases (the active one marked), Tables, Views, Programmability, columns under a table with type and key icons. Columns load on expand. Enter or double-click a table to open `SELECT TOP (1000)` in a new tab.
 - Query tabs with a full-height buffer, T-SQL highlighting, undo. Multiple result sets, a Messages tab with SSMS-style errors (`Msg 208, Level 16, State 1, Line 3`), and row counts.
+- Results are a spreadsheet-style grid: click a cell, shift-click to extend, click a column header or a row number to select the whole column or row, arrows and shift+arrows to move and extend, ctrl+a to select all. Ctrl+c copies the selection as tab-separated text (ctrl+shift+c adds the column headers), so it pastes into Excel as cells. NULL copies as an empty cell. Esc returns focus to the editor.
 - Completion from the active database's catalog (loaded in the background): tables after `FROM`/`JOIN`, columns after `alias.`, databases after `USE`, schemas, functions, keywords. It shows in the dock above the status line.
+
+Opening any database in the tree loads its objects without changing the editor's database; double-click a database to switch to it.
 
 Keys: F5 runs the script (split at `GO`), ctrl+enter runs the statement at the caret, esc cancels, ctrl+space completes (tab or enter accepts, up/down moves), ctrl+e exports the statement's full result to CSV, ctrl+n/ctrl+w new/close tab, ctrl+s saves, F8 toggles write mode, F6 switches explorer/editor, ctrl+q quits.
 
@@ -24,4 +27,4 @@ Read-only is the default. The guard refuses statements that look like writes; it
 
 `cargo install --path .`, then `tern plugin link plugin`; palette command "SQL Server: Open Tab". The status line says `native edit` or `key edit` depending on how the terminal delivers typing.
 
-Built and tested on Windows; macOS arm64 builds and passes tests (not run against a server). CI builds all three OSes. Not yet built: Entra auth, query history, results sort/filter/copy, execution plans, Script as, table designer.
+Built and tested on Windows; macOS arm64 builds and passes tests (not run against a server). CI builds all three OSes. Not yet built, in this order: saved connections and a connection dialog, query history, Script as, results sort and filter, export to JSON and INSERT, execution plans, Entra sign-in, a security explorer (users, roles, permissions), SQL Agent jobs, table designer.

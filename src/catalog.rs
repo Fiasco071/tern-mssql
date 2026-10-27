@@ -59,7 +59,7 @@ pub struct Catalog {
 }
 
 const OBJECTS: &str = "SELECT s.name, o.name, o.type \
-	FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+	FROM {p}sys.objects o JOIN {p}sys.schemas s ON s.schema_id = o.schema_id \
 	WHERE o.is_ms_shipped = 0 AND o.type IN ('U','V','P','FN','IF','TF','FS','FT') \
 	ORDER BY s.name, o.name";
 
@@ -72,14 +72,14 @@ const COLUMNS: &str = "SELECT s.name, o.name, c.name, \
 		THEN t.name + '(' + CAST(c.precision AS varchar(5)) + ',' + CAST(c.scale AS varchar(5)) + ')' \
 	ELSE t.name END, \
 	c.is_nullable, c.is_identity, \
-	CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i \
+	CASE WHEN EXISTS (SELECT 1 FROM {p}sys.index_columns ic JOIN {p}sys.indexes i \
 		ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
 		WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) \
 		THEN 1 ELSE 0 END \
-	FROM sys.columns c \
-	JOIN sys.objects o ON o.object_id = c.object_id \
-	JOIN sys.schemas s ON s.schema_id = o.schema_id \
-	JOIN sys.types t ON t.user_type_id = c.user_type_id \
+	FROM {p}sys.columns c \
+	JOIN {p}sys.objects o ON o.object_id = c.object_id \
+	JOIN {p}sys.schemas s ON s.schema_id = o.schema_id \
+	JOIN {p}sys.types t ON t.user_type_id = c.user_type_id \
 	WHERE o.is_ms_shipped = 0 AND o.type IN ('U','V','IF','TF') \
 	ORDER BY s.name, o.name, c.column_id";
 
@@ -89,10 +89,11 @@ fn text(c: &Option<String>) -> &str {
 }
 
 impl Catalog {
-	/// Loads the current database's catalog.
-	pub fn load(db: &mut dyn Backend) -> anyhow::Result<Self> {
+	/// Loads a database's catalog: `database` by three-part names, or the connection's current one for `None`.
+	pub fn load(db: &mut dyn Backend, database: Option<&str>) -> anyhow::Result<Self> {
+		let p = database.map_or_else(String::new, |d| format!("[{}].", d.replace(']', "]]")));
 		let mut cat = Self::default();
-		for r in db.query(OBJECTS, usize::MAX)?.rows {
+		for r in db.query(&OBJECTS.replace("{p}", &p), usize::MAX)?.rows {
 			let kind = match text(&r[2]).trim() {
 				"U" => ObjKind::Table,
 				"V" => ObjKind::View,
@@ -108,7 +109,7 @@ impl Catalog {
 			});
 		}
 		cat.finish();
-		for r in db.query(COLUMNS, usize::MAX)?.rows {
+		for r in db.query(&COLUMNS.replace("{p}", &p), usize::MAX)?.rows {
 			let full = format!("{}.{}", text(&r[0]), text(&r[1])).to_lowercase();
 			let Some(&i) = cat.by_full.get(&full) else { continue };
 			cat.objects[i].columns.push(Col {

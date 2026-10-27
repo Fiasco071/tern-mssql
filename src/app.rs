@@ -2,14 +2,14 @@
 //! full-screen Tern surface.
 
 use std::{
-	collections::{HashSet, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	path::PathBuf,
 	time::{Duration, Instant},
 };
 
 use tern_sdk::{
 	Input, Options, Session, SurfaceOptions, nodes,
-	ui::{self, Column, Side, Span, TableRow, Tone, TreeItem, View},
+	ui::{self, Side, Span, Tone, TreeItem, View, html},
 	wire::{self, Event, feature},
 };
 
@@ -27,6 +27,8 @@ const LIMIT: usize = 1000;
 const EDITOR: &str = "main.body.work.ed";
 /// The explorer's id.
 const TREE: &str = "main.body.tree";
+/// Separates the parts of an object id (database names can hold dots).
+const SEP: char = '\u{1f}';
 
 /// What node handlers report.
 #[derive(Clone, Debug)]
@@ -47,6 +49,44 @@ enum Msg {
 	Tab(String),
 	/// A results tab was chosen.
 	ResultTab(String),
+	/// A result cell was clicked: row, column.
+	Cell(usize, usize),
+	/// A column header was clicked.
+	Col(usize),
+	/// A row number was clicked.
+	Row(usize),
+	/// The corner of the grid was clicked.
+	GridAll,
+}
+
+/// The selected block of result cells: where it started and where the caret is.
+#[derive(Clone, Copy, Debug)]
+struct Sel {
+	r0: usize,
+	c0: usize,
+	r1: usize,
+	c1: usize,
+}
+
+impl Sel {
+	/// `(first row, last row, first column, last column)`.
+	fn bounds(self) -> (usize, usize, usize, usize) {
+		(self.r0.min(self.r1), self.r0.max(self.r1), self.c0.min(self.c1), self.c0.max(self.c1))
+	}
+
+	fn rows(self) -> std::ops::RangeInclusive<usize> {
+		let (a, b, ..) = self.bounds();
+		a..=b
+	}
+
+	fn cols(self) -> std::ops::RangeInclusive<usize> {
+		let (.., a, b) = self.bounds();
+		a..=b
+	}
+
+	fn contains(self, r: usize, c: usize) -> bool {
+		self.rows().contains(&r) && self.cols().contains(&c)
+	}
 }
 
 /// One query buffer.
@@ -230,6 +270,8 @@ struct Output {
 	error:    bool,
 	/// Active tab: an index into `sets`, or `sets.len()` for Messages.
 	tab:      usize,
+	/// The selected cells of the active result set.
+	sel:      Option<Sel>,
 }
 
 /// A job waiting on or running in the worker.
@@ -254,8 +296,12 @@ struct App {
 	profile:   String,
 	server:    String,
 	databases: Vec<String>,
+	/// The database the connection (and so the editor) is in.
 	current:   String,
-	catalog:   Option<Catalog>,
+	/// Loaded catalogs by database name.
+	catalogs:  HashMap<String, Catalog>,
+	/// Databases whose catalog is being loaded.
+	loading:   HashSet<String>,
 	buffers:   Vec<Buffer>,
 	active:    usize,
 	next_id:   usize,
@@ -268,6 +314,8 @@ struct App {
 	in_editor: bool,
 	/// Native `edit` events seen; while zero, plain keys edit the buffer.
 	native:    usize,
+	/// Keys go to the results grid (selection, copy) instead of the editor.
+	grid_focus: bool,
 }
 
 /// `[schema].[name]`.
@@ -309,20 +357,35 @@ impl App {
 			server,
 			databases,
 			current: current.clone(),
-			catalog: None,
+			catalogs: HashMap::new(),
+			loading: HashSet::new(),
 			next_id: buffers.len() + 1,
 			buffers,
 			active: 0,
 			out: Output::default(),
 			popup: None,
-			expanded: ["srv".to_owned(), format!("db:{current}"), "g:tables".to_owned()].into(),
+			expanded: ["srv".to_owned(), format!("db:{current}"), format!("g:{current}:tables")].into(),
 			note: String::new(),
 			write: false,
 			in_editor: true,
 			native: 0,
+			grid_focus: false,
 		};
-		app.start(Job::Catalog, "loading catalog");
+		app.ensure_catalog(&current);
 		Ok(app)
+	}
+
+	/// The catalog of the database the editor is in.
+	fn catalog(&self) -> Option<&Catalog> {
+		self.catalogs.get(&self.current)
+	}
+
+	/// Starts loading `db`'s catalog unless it is loaded or loading.
+	fn ensure_catalog(&mut self, db: &str) {
+		if self.catalogs.contains_key(db) || !self.loading.insert(db.to_owned()) {
+			return;
+		}
+		self.start(Job::Catalog(db.to_owned()), "loading objects");
 	}
 
 	fn buf(&mut self) -> &mut Buffer {
@@ -447,21 +510,28 @@ impl App {
 			Reply::Ran(RunResult { sets, messages, ms, error }) => {
 				self.note = format!("{ms} ms");
 				let tab = if error.is_some() || sets.is_empty() { sets.len() } else { 0 };
-				self.out = Output { sets, messages, error: error.is_some(), tab };
+				self.out = Output { sets, messages, error: error.is_some(), tab, sel: None };
+				self.grid_focus = false;
 			},
 			Reply::Exported(Ok((path, n))) => {
 				let full = std::fs::canonicalize(&path).unwrap_or(path);
 				self.note = format!("{n} rows in {took} ms to {}", full.display());
 			},
 			Reply::Exported(Err(e)) => self.show_error(e),
-			Reply::Switched(name, Ok(cat)) => {
-				self.expanded.insert(format!("db:{name}"));
+			Reply::Switched(name, Ok(())) => {
 				self.current = name;
-				self.catalog = Some(cat);
 				self.popup = None;
 			},
-			Reply::Switched(_, Err(e)) | Reply::Catalog(Err(e)) => self.show_error(e),
-			Reply::Catalog(Ok(cat)) => self.catalog = Some(cat),
+			Reply::Switched(_, Err(e)) => self.show_error(e),
+			Reply::Catalog(name, result) => {
+				self.loading.remove(&name);
+				match result {
+					Ok(cat) => {
+						self.catalogs.insert(name, cat);
+					},
+					Err(e) => self.show_error(e),
+				}
+			},
 			Reply::Cancelled => self.note = "cancelled".into(),
 		}
 		if let Some(p) = self.queue.front() {
@@ -477,14 +547,16 @@ impl App {
 	/// A tree row was activated.
 	fn activate(&mut self, id: &str) {
 		if let Some(name) = id.strip_prefix("db:") {
+			self.ensure_catalog(name);
 			if name != self.current {
-				self.catalog = None;
 				self.start(Job::Switch(name.to_owned()), "switching");
 			}
 		} else if let Some(full) = id.strip_prefix("o:") {
-			let Some((schema, name)) = full.split_once('.') else { return };
-			let Some(kind) = self.catalog.as_ref().and_then(|c| c.find(Some(schema), name)).map(|o| o.kind) else { return };
-			let q = quoted(schema, name);
+			let mut parts = full.splitn(3, SEP);
+			let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
+			let Some(kind) = self.catalogs.get(db).and_then(|c| c.find(Some(schema), name)).map(|o| o.kind) else { return };
+			// An object in another database is reached by its three-part name, so the editor's database stays put.
+			let q = if db == self.current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) };
 			let sql = match kind {
 				ObjKind::Table | ObjKind::View => format!("SELECT TOP (1000) *\nFROM {q}"),
 				ObjKind::Proc => format!("EXEC {q}"),
@@ -500,7 +572,7 @@ impl App {
 	/// Recomputes the completion popup after an edit or on request.
 	fn complete(&mut self, force: bool) {
 		let b = &self.buffers[self.active];
-		self.popup = complete::complete(&b.text, b.cursor_byte(), self.catalog.as_ref(), &self.databases, force)
+		self.popup = complete::complete(&b.text, b.cursor_byte(), self.catalog(), &self.databases, force)
 			.map(|comp| Popup { comp, sel: 0 });
 	}
 
@@ -517,7 +589,7 @@ impl App {
 		b.dirty = true;
 	}
 
-	/// The explorer, styled like the file explorer: folders that open and close, an icon per kind, the active database marked.
+	/// The explorer, styled like the file explorer: every database opens and closes, an icon per kind, the editor's database marked.
 	fn explorer(&self) -> ui::Tree<Msg> {
 		let open = |id: &str| self.expanded.contains(id);
 		let mut srv = TreeItem::new("srv", vec![span(self.profile.clone(), "strong"), span(format!("  {}", self.server), "dim")])
@@ -525,34 +597,37 @@ impl App {
 		srv.icon = Some("server".into());
 		for d in &self.databases {
 			let id = format!("db:{d}");
-			let active = *d == self.current;
-			let label = if active { vec![span("● ", "accent"), span(d.clone(), "strong")] } else { vec![span(d.clone(), "")] };
-			let mut item = TreeItem::new(id.clone(), label).open(active && open(&id));
+			let label = if *d == self.current { vec![span("● ", "accent"), span(d.clone(), "strong")] } else { vec![span(d.clone(), "")] };
+			let mut item = TreeItem::new(id.clone(), label).open(open(&id));
 			item.icon = Some("database".into());
-			if active {
-				item.children = self.catalog_items();
-			}
+			item.children = match self.catalogs.get(d) {
+				Some(cat) => self.catalog_items(d, cat),
+				None => {
+					// A child keeps the chevron; opening the database loads its objects.
+					let (text, icon) = if self.loading.contains(d) { ("loading objects...", "timer") } else { ("...", "more") };
+					let mut placeholder = TreeItem::new(format!("p:{id}"), vec![span(text, "dim")]);
+					placeholder.icon = Some(icon.into());
+					vec![placeholder]
+				},
+			};
 			srv = srv.child(item);
 		}
 		ui::tree().key("tree").basis(0.24).grow(0.0).on_activate(|id| Msg::Activate(id.to_owned())).on_toggle(|_| Msg::Toggle).item(srv)
 	}
 
-	/// The active database's folders and objects.
-	fn catalog_items(&self) -> Vec<TreeItem> {
-		let Some(cat) = &self.catalog else {
-			let mut loading = TreeItem::new("loading", vec![span("loading objects...", "dim")]);
-			loading.icon = Some("timer".into());
-			return vec![loading];
-		};
-		let folder = |id: &str, title: &str, count: usize| {
-			let mut f = TreeItem::new(id, vec![span(title.to_owned(), ""), span(format!("  {count}"), "dim")]).open(self.expanded.contains(id));
-			f.icon = Some(if self.expanded.contains(id) { "folder-open" } else { "folder" }.into());
+	/// One database's folders and objects.
+	fn catalog_items(&self, db: &str, cat: &Catalog) -> Vec<TreeItem> {
+		let folder = |group: &str, title: &str, count: usize| {
+			let id = format!("g:{db}:{group}");
+			let is_open = self.expanded.contains(&id);
+			let mut f = TreeItem::new(id, vec![span(title.to_owned(), ""), span(format!("  {count}"), "dim")]).open(is_open);
+			f.icon = Some(if is_open { "folder-open" } else { "folder" }.into());
 			f
 		};
 		let objects = |kind: ObjKind, icon: &'static str| -> Vec<TreeItem> {
 			cat.of(kind)
 				.map(|o| {
-					let id = format!("o:{}", o.full());
+					let id = format!("o:{db}{SEP}{}{SEP}{}", o.schema, o.name);
 					let mut label = vec![span(o.name.clone(), "")];
 					if !o.schema.eq_ignore_ascii_case("dbo") {
 						label.push(span(format!("  {}", o.schema), "dim"));
@@ -563,7 +638,7 @@ impl App {
 						if self.expanded.contains(&id) {
 							for c in &o.columns {
 								let mut col = TreeItem::new(
-									format!("c:{}.{}", o.full(), c.name),
+									format!("c:{db}{SEP}{}{SEP}{}{SEP}{}", o.schema, o.name, c.name),
 									vec![
 										span(c.name.clone(), if c.key { "strong" } else { "" }),
 										span(format!("  {}{}", c.ty, if c.nullable { "" } else { " not null" }), "dim"),
@@ -580,17 +655,126 @@ impl App {
 				})
 				.collect()
 		};
-		let mut tables = folder("g:tables", "Tables", cat.of(ObjKind::Table).count());
+		let mut tables = folder("tables", "Tables", cat.of(ObjKind::Table).count());
 		tables.children = objects(ObjKind::Table, "grid");
-		let mut views = folder("g:views", "Views", cat.of(ObjKind::View).count());
+		let mut views = folder("views", "Views", cat.of(ObjKind::View).count());
 		views.children = objects(ObjKind::View, "eye");
-		let mut procs = folder("g:procs", "Stored Procedures", cat.of(ObjKind::Proc).count());
+		let mut procs = folder("procs", "Stored Procedures", cat.of(ObjKind::Proc).count());
 		procs.children = objects(ObjKind::Proc, "code");
-		let mut funcs = folder("g:funcs", "Functions", cat.of(ObjKind::Func).count());
+		let mut funcs = folder("funcs", "Functions", cat.of(ObjKind::Func).count());
 		funcs.children = objects(ObjKind::Func, "braces");
-		let mut prog = folder("g:prog", "Programmability", cat.of(ObjKind::Proc).count() + cat.of(ObjKind::Func).count());
+		let mut prog = folder("prog", "Programmability", cat.of(ObjKind::Proc).count() + cat.of(ObjKind::Func).count());
 		prog.children = vec![procs, funcs];
 		vec![tables, views, prog]
+	}
+
+	/// The size of the shown result set: (rows, columns).
+	fn grid_dims(&self) -> Option<(usize, usize)> {
+		self.out.sets.get(self.out.tab).map(|s| (s.rows.len(), s.columns.len()))
+	}
+
+	/// A click on a cell: select it, or extend the selection to it with shift.
+	fn click_cell(&mut self, r: usize, c: usize, shift: bool) {
+		self.grid_focus = true;
+		self.out.sel = Some(match (shift, self.out.sel) {
+			(true, Some(s)) => Sel { r1: r, c1: c, ..s },
+			_ => Sel { r0: r, c0: c, r1: r, c1: c },
+		});
+	}
+
+	/// A click on a column header: the whole column, or a range of columns with shift.
+	fn click_col(&mut self, c: usize, shift: bool) {
+		let Some((rows, _)) = self.grid_dims().filter(|d| d.0 > 0) else { return };
+		self.grid_focus = true;
+		self.out.sel = Some(match (shift, self.out.sel) {
+			(true, Some(s)) => Sel { r0: 0, r1: rows - 1, c1: c, ..s },
+			_ => Sel { r0: 0, c0: c, r1: rows - 1, c1: c },
+		});
+	}
+
+	/// A click on a row number: the whole row, or a range of rows with shift.
+	fn click_row(&mut self, r: usize, shift: bool) {
+		let Some((_, cols)) = self.grid_dims().filter(|d| d.1 > 0) else { return };
+		self.grid_focus = true;
+		self.out.sel = Some(match (shift, self.out.sel) {
+			(true, Some(s)) => Sel { c0: 0, c1: cols - 1, r1: r, ..s },
+			_ => Sel { r0: r, c0: 0, r1: r, c1: cols - 1 },
+		});
+	}
+
+	/// Selects every cell.
+	fn select_all(&mut self) {
+		if let Some((rows, cols)) = self.grid_dims().filter(|d| d.0 > 0 && d.1 > 0) {
+			self.grid_focus = true;
+			self.out.sel = Some(Sel { r0: 0, c0: 0, r1: rows - 1, c1: cols - 1 });
+		}
+	}
+
+	/// Keys while the grid has focus: arrows move (shift extends), ctrl+a selects all, ctrl+c copies, esc returns to the editor.
+	fn grid_key(&mut self, key: &tern_sdk::keys::Key) -> bool {
+		if key.is("escape") {
+			self.grid_focus = false;
+			return true;
+		}
+		let Some((rows, cols)) = self.grid_dims().filter(|d| d.0 > 0 && d.1 > 0) else { return false };
+		if key.ctrl && key.name == "a" {
+			self.select_all();
+			return true;
+		}
+		if key.ctrl && key.name == "c" {
+			self.copy(key.shift);
+			return true;
+		}
+		let mut s = self.out.sel.unwrap_or(Sel { r0: 0, c0: 0, r1: 0, c1: 0 });
+		match key.name.as_str() {
+			"left" => s.c1 = if key.ctrl { 0 } else { s.c1.saturating_sub(1) },
+			"right" => s.c1 = if key.ctrl { cols - 1 } else { (s.c1 + 1).min(cols - 1) },
+			"up" => s.r1 = if key.ctrl { 0 } else { s.r1.saturating_sub(1) },
+			"down" => s.r1 = if key.ctrl { rows - 1 } else { (s.r1 + 1).min(rows - 1) },
+			"home" => s.c1 = 0,
+			"end" => s.c1 = cols - 1,
+			"pageup" => s.r1 = s.r1.saturating_sub(10),
+			"pagedown" => s.r1 = (s.r1 + 10).min(rows - 1),
+			_ => return false,
+		}
+		if !key.shift {
+			s.r0 = s.r1;
+			s.c0 = s.c1;
+		}
+		self.out.sel = Some(s);
+		true
+	}
+
+	/// The selected cells as tab-separated text, the way Excel copies them. NULL is an empty cell.
+	fn tsv(&self, headers: bool) -> Option<(String, usize)> {
+		let set = self.out.sets.get(self.out.tab)?;
+		let (r0, r1, c0, c1) = self.out.sel?.bounds();
+		let field = |t: &str| {
+			if t.contains(['\t', '\n', '\r', '"']) { format!("\"{}\"", t.replace('"', "\"\"")) } else { t.to_owned() }
+		};
+		let mut lines: Vec<String> = Vec::new();
+		if headers {
+			lines.push((c0..=c1).map(|c| field(&set.columns[c])).collect::<Vec<_>>().join("\t"));
+		}
+		for r in r0..=r1 {
+			lines.push((c0..=c1).map(|c| set.rows[r][c].as_deref().map(field).unwrap_or_default()).collect::<Vec<_>>().join("\t"));
+		}
+		let mut text = lines.join("\n");
+		if r1 > r0 {
+			text.push('\n');
+		}
+		Some((text, (r1 - r0 + 1) * (c1 - c0 + 1)))
+	}
+
+	/// Copies the selection to the system clipboard.
+	fn copy(&mut self, headers: bool) {
+		match self.tsv(headers) {
+			Some((text, cells)) => match crate::clip::set(&text) {
+				Ok(()) => self.note = format!("copied {cells} cell{}", if cells == 1 { "" } else { "s" }),
+				Err(e) => self.note = format!("copy failed: {e}"),
+			},
+			None => self.note = "nothing selected".into(),
+		}
 	}
 
 	/// The results area: a tab per result set, then Messages.
@@ -614,18 +798,33 @@ impl App {
 			col
 		} else {
 			let r = &o.sets[o.tab];
-			let mut table = ui::table().key("grid");
-			for (i, name) in r.columns.iter().enumerate() {
-				table = table.col(Column::new(format!("c{i}"), name.clone()));
+			let class = |on: bool, base: &str| if on { format!("{base} sel") } else { base.to_owned() };
+			let mut head = html::tr().child(html::th("#").class("rn").on_click(Msg::GridAll));
+			for (c, name) in r.columns.iter().enumerate() {
+				let on = o.sel.is_some_and(|s| s.cols().contains(&c));
+				head = head.child(html::th(name.clone()).class(class(on, "ch")).on_click(Msg::Col(c)));
 			}
-			for (n, row) in r.rows.iter().enumerate() {
-				let mut tr = TableRow::new(n.to_string());
-				for (i, c) in row.iter().enumerate() {
-					tr = tr.cell(format!("c{i}"), c.as_deref().map_or_else(|| "NULL".to_owned(), flat));
+			let rows = r.rows.iter().enumerate().map(|(n, row)| {
+				let row_on = o.sel.is_some_and(|s| s.rows().contains(&n));
+				let mut tr = html::tr().child(html::td((n + 1).to_string()).class(class(row_on, "rn")).on_click(Msg::Row(n)));
+				for (c, cell) in row.iter().enumerate() {
+					let picked = o.sel.is_some_and(|s| s.contains(n, c));
+					let cur = o.sel.is_some_and(|s| (s.r1, s.c1) == (n, c));
+					let mut cls = String::new();
+					for (on, name) in [(picked, "sel"), (cur, "cur"), (cell.is_none(), "null")] {
+						if on {
+							cls.push_str(name);
+							cls.push(' ');
+						}
+					}
+					tr = tr.child(
+						html::td(cell.as_deref().map_or_else(|| "NULL".to_owned(), flat)).class(cls.trim().to_owned()).on_click(Msg::Cell(n, c)),
+					);
 				}
-				table = table.row(tr);
-			}
-			ui::col().key("body").child(table)
+				tr
+			});
+			let table = html::table().class("grid").child(html::thead().child(head)).child(html::tbody().children(rows));
+			ui::col().key("body").child(html::div().class("gridwrap").child(table))
 		};
 		ui::col().key("res").max(ui::Bound::h(ui::Extent::Lines(16.0))).child(tabs).child(body)
 	}
@@ -680,7 +879,7 @@ impl App {
 		let b = &self.buffers[self.active];
 		let (line, col) = b.line_col();
 		let body = ui::row().key("body").grow(1.0).align(ui::Align::Stretch).child(self.explorer()).child(self.work());
-		let catalog = self.catalog.as_ref().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
+		let catalog = self.catalog().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
 		let status = ui::status()
 			.key("bar")
 			.child(ui::seg(format!("{} / {}", self.profile, self.current)).icon("database"))
@@ -701,6 +900,22 @@ impl App {
 	}
 }
 
+/// The results grid: cells that select and copy like a spreadsheet's.
+const GRID_CSS: &str = "\
+.grid{border-collapse:collapse;font-variant-numeric:tabular-nums}\
+.grid th{position:sticky;top:0;text-align:left;font-weight:600;padding:2px 14px 2px 8px;white-space:nowrap;cursor:pointer;color:var(--sf-c-muted)}\
+.grid td{padding:1px 14px 1px 8px;white-space:nowrap;cursor:cell}\
+.grid .rn{text-align:right;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
+.grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 26%,transparent)}\
+.grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
+.grid td.null{font-style:italic;color:var(--sf-c-muted)}\
+.gridwrap{overflow:auto;max-height:19em;max-height:15lh}";
+
+/// Is shift held in a click event?
+fn shift_held(ev: &Event) -> bool {
+	matches!(ev, Event::Action(a) if a.mods.iter().any(|m| m == "shift"))
+}
+
 /// Runs the client until the user quits.
 pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, files: &[PathBuf]) -> anyhow::Result<()> {
 	let Some(mut session) = Session::connect(Options::new().feature(feature::SEND).feature(feature::EDIT).feature(feature::UNDO))? else {
@@ -708,6 +923,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	};
 	let mut app = App::new(db, profile, server, files)?;
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server").role("sqlq"))?;
+	session.stylesheet(sf, "grid", Some(GRID_CSS))?;
 	draw(&mut session, sf, &app)?;
 	session.focus(sf, Some(EDITOR))?;
 	loop {
@@ -728,8 +944,12 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		match input {
 			Input::Key(key) => {
 				let popup = app.popup.is_some();
-				if key.is("ctrl+q") || key.is("ctrl+c") {
+				if key.is("ctrl+q") {
 					break;
+				} else if app.grid_focus && app.grid_key(&key) {
+					if !app.grid_focus {
+						session.focus(sf, Some(EDITOR))?;
+					}
 				} else if popup && key.is("escape") {
 					app.popup = None;
 				} else if popup && (key.name == "down" || key.name == "up") {
@@ -760,7 +980,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				} else if key.is("f6") {
 					app.in_editor = !app.in_editor;
 					session.focus(sf, Some(if app.in_editor { EDITOR } else { TREE }))?;
-				} else if app.native == 0 && app.buf().key(&key) {
+				} else if app.native == 0 && !app.grid_focus && app.buf().key(&key) {
 					app.complete(false);
 				}
 			},
@@ -777,6 +997,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 			},
 			Input::Msg(Msg::Focus, _) => {
 				app.in_editor = true;
+				app.grid_focus = false;
 				session.focus(sf, Some(EDITOR))?;
 			},
 			Input::Msg(Msg::Activate(id), _) => app.activate(&id),
@@ -786,8 +1007,28 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 						app.expanded.remove(id);
 					} else {
 						app.expanded.insert(id.to_owned());
+						// Opening a database loads its objects.
+						if let Some(db) = id.strip_prefix("db:") {
+							app.ensure_catalog(db);
+						}
 					}
 				}
+			},
+			Input::Msg(Msg::Cell(r, c), ev) => {
+				app.click_cell(r, c, shift_held(&ev));
+				session.focus(sf, None)?;
+			},
+			Input::Msg(Msg::Col(c), ev) => {
+				app.click_col(c, shift_held(&ev));
+				session.focus(sf, None)?;
+			},
+			Input::Msg(Msg::Row(r), ev) => {
+				app.click_row(r, shift_held(&ev));
+				session.focus(sf, None)?;
+			},
+			Input::Msg(Msg::GridAll, _) => {
+				app.select_all();
+				session.focus(sf, None)?;
 			},
 			Input::Msg(Msg::Pick(id), _) => {
 				if let Ok(i) = id.parse::<usize>() {
@@ -805,6 +1046,8 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 			},
 			Input::Msg(Msg::ResultTab(id), _) => {
 				app.out.tab = if id == "msg" { app.out.sets.len() } else { id.trim_start_matches('r').parse().unwrap_or(0) };
+				app.out.sel = None;
+				app.grid_focus = false;
 			},
 			_ => continue,
 		}

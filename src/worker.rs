@@ -21,10 +21,10 @@ pub enum Job {
 	Run { batches: Vec<String>, limit: usize },
 	/// Run a statement and write every row to a CSV file.
 	Export { sql: String, path: PathBuf },
-	/// Switch database, then load its catalog.
+	/// Switch the connection to a database.
 	Switch(String),
-	/// Load the current database's catalog.
-	Catalog,
+	/// Load a database's catalog.
+	Catalog(String),
 }
 
 /// Everything a script run produced.
@@ -45,10 +45,10 @@ pub enum Reply {
 	Ran(RunResult),
 	/// An export finished: the file and its row count.
 	Exported(Result<(PathBuf, usize), String>),
-	/// A database switch finished: the name and its catalog.
-	Switched(String, Result<Catalog, String>),
-	/// The catalog was (re)loaded.
-	Catalog(Result<Catalog, String>),
+	/// A database switch finished.
+	Switched(String, Result<(), String>),
+	/// A database's catalog was loaded.
+	Catalog(String, Result<Catalog, String>),
 	/// The job was cancelled and the connection replaced.
 	Cancelled,
 }
@@ -107,10 +107,13 @@ fn run<B: Backend>(db: &mut B, job: Job, cancel: &Cancel) -> Reply {
 			},
 		},
 		Job::Switch(name) => {
-			let result = db.use_database(&name).and_then(|()| Catalog::load(db));
+			let result = db.use_database(&name);
 			Reply::Switched(name, result.map_err(|e| format!("{e:#}")))
 		},
-		Job::Catalog => Reply::Catalog(Catalog::load(db).map_err(|e| format!("{e:#}"))),
+		Job::Catalog(name) => {
+			let result = Catalog::load(db, Some(&name)).map_err(|e| format!("{e:#}"));
+			Reply::Catalog(name, result)
+		},
 	}
 }
 

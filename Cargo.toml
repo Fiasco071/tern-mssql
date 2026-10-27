@@ -22,3 +22,6 @@ codegen-units = 1
 strip = true
 opt-level = "z"
 panic = "abort"
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
