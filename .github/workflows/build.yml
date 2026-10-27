@@ -1,0 +1,25 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tern-mssql-${{ matrix.os }}
+          path: |
+            target/release/tern-mssql
+            target/release/tern-mssql.exe
+          if-no-files-found: ignore

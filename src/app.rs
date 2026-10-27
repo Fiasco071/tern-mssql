@@ -452,3 +452,64 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String) -> anyhow::Resul
 	session.close()?;
 	Ok(())
 }
+
+/// What the profile picker reports.
+#[derive(Clone, Debug)]
+enum Pick {
+	/// A row was activated: the profile's name.
+	Chosen(String),
+}
+
+/// The picker's list.
+fn picker_view(profiles: &[(String, String)], at: usize) -> View<Pick> {
+	let mut list = ui::list::<Pick>()
+		.key("profiles")
+		.selected(profiles[at].0.clone())
+		.on_activate(|id| Pick::Chosen(id.to_owned()));
+	for (name, detail) in profiles {
+		list = list.child(
+			ui::item(name.clone())
+				.key(name.clone())
+				.detail(detail.clone())
+				.icon("database"),
+		);
+	}
+	View::new().main(ui::col().child(ui::md("**Connect to**").key("h")).child(list))
+}
+
+/// Shows the profiles as a list and returns the one chosen, or `None` on quit.
+/// Up, down and enter work from the keyboard as well as the list's own events.
+pub fn pick(profiles: &[(String, String)]) -> anyhow::Result<Option<String>> {
+	if profiles.is_empty() {
+		anyhow::bail!("no profiles in {}", crate::profile::path().display());
+	}
+	let Some(mut session) = Session::<Pick>::connect(Options::new())? else {
+		anyhow::bail!("pick a profile by name outside Tern: tern-mssql PROFILE");
+	};
+	let sf = session.open(SurfaceOptions::screen().title("SQL Server"))?;
+	let mut at = 0;
+	session.render(sf, picker_view(profiles, at))?;
+	session.focus(sf, Some("main.profiles"))?;
+	let chosen = loop {
+		match session.next(None) {
+			Ok(Some(Input::Msg(Pick::Chosen(name), _))) => break Some(name),
+			Ok(Some(Input::Key(k))) => {
+				if k.is("escape") || k.is("ctrl+q") || k.is("ctrl+c") {
+					break None;
+				}
+				match k.name.as_str() {
+					"enter" => break Some(profiles[at].0.clone()),
+					"down" => at = (at + 1).min(profiles.len() - 1),
+					"up" => at = at.saturating_sub(1),
+					_ => continue,
+				}
+				session.render(sf, picker_view(profiles, at))?;
+			},
+			Ok(_) => {},
+			Err(tern_sdk::Error::InputClosed) => break None,
+			Err(e) => return Err(e.into()),
+		}
+	};
+	session.close()?;
+	Ok(chosen)
+}

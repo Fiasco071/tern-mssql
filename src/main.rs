@@ -1,4 +1,4 @@
-//! `tern-mssql PROFILE`: the interactive client.
+//! `tern-mssql [PROFILE]`: the interactive client (a picker when PROFILE is omitted).
 //! `tern-mssql query PROFILE SQL`: one batch printed as a table.
 //! `tern-mssql profiles`: the saved profiles.
 
@@ -60,6 +60,17 @@ fn main() -> anyhow::Result<()> {
 			Ok(())
 		},
 		[name] => app::run(connect(name)?, (*name).to_owned()),
+		[] => {
+			let profiles = profile::load()?;
+			let rows: Vec<(String, String)> = profiles
+				.iter()
+				.map(|p| (p.name.clone(), format!("{}  {}", p.server, p.user)))
+				.collect();
+			match app::pick(&rows)? {
+				Some(name) => app::run(connect(&name)?, name),
+				None => Ok(()),
+			}
+		},
 		_ => bail!(
 			"usage: tern-mssql PROFILE | query PROFILE SQL | profiles   (profiles: {})",
 			profile::path().display()
