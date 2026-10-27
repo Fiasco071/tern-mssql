@@ -49,38 +49,47 @@ pub enum Outcome {
 
 /// Receives a batch as it arrives.
 pub trait Sink {
+	/// A statement that returns no rows changed `n` rows.
+	fn affected(&mut self, _n: u64) {}
 	/// The column names, once, before any row.
 	fn columns(&mut self, columns: &[String]);
 	/// One row. Returns false to stop reading.
 	fn row(&mut self, row: Vec<Option<String>>) -> bool;
 }
 
-/// Collects up to `limit` rows.
+/// Collects every result set, up to `limit` rows each, and the rows-affected counts.
 pub struct Collect {
-	/// The result so far.
-	pub rows:  Rows,
-	limit:     usize,
+	/// The result sets so far.
+	pub sets:     Vec<Rows>,
+	/// Rows changed by statements that returned none, in order.
+	pub affected: Vec<u64>,
+	limit:        usize,
 }
 
 impl Collect {
-	/// An empty collector with a row cap.
+	/// An empty collector with a per-set row cap.
 	pub const fn new(limit: usize) -> Self {
-		Self { rows: Rows { columns: Vec::new(), rows: Vec::new(), capped: false }, limit }
+		Self { sets: Vec::new(), affected: Vec::new(), limit }
 	}
 }
 
 impl Sink for Collect {
 	fn columns(&mut self, columns: &[String]) {
-		self.rows.columns = columns.to_vec();
+		self.sets.push(Rows { columns: columns.to_vec(), rows: Vec::new(), capped: false });
 	}
 
 	fn row(&mut self, row: Vec<Option<String>>) -> bool {
-		if self.rows.rows.len() >= self.limit {
-			self.rows.capped = true;
+		let Some(set) = self.sets.last_mut() else { return true };
+		if set.rows.len() >= self.limit {
+			set.capped = true;
 			return false;
 		}
-		self.rows.rows.push(row);
+		set.rows.push(row);
 		true
+	}
+
+	fn affected(&mut self, n: u64) {
+		self.affected.push(n);
 	}
 }
 
@@ -95,7 +104,7 @@ pub trait Backend {
 	fn query(&mut self, sql: &str, limit: usize) -> anyhow::Result<Rows> {
 		let mut sink = Collect::new(limit);
 		self.stream(sql, &Cancel::new(), &mut sink)?;
-		Ok(sink.rows)
+		Ok(sink.sets.into_iter().next().unwrap_or(Rows { columns: Vec::new(), rows: Vec::new(), capped: false }))
 	}
 
 	/// The first column of every row, as text.
@@ -112,10 +121,5 @@ pub trait Backend {
 	/// The database the connection is in.
 	fn current(&mut self) -> anyhow::Result<String> {
 		Ok(self.column("SELECT DB_NAME()")?.into_iter().next().unwrap_or_default())
-	}
-
-	/// User tables and views of the current database as `schema.name`.
-	fn tables(&mut self) -> anyhow::Result<Vec<String>> {
-		self.column("SELECT TABLE_SCHEMA + '.' + TABLE_NAME FROM INFORMATION_SCHEMA.TABLES ORDER BY 1")
 	}
 }

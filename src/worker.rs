@@ -10,26 +10,45 @@ use std::{
 	time::Instant,
 };
 
-use crate::backend::{Backend, Cancel, Collect, Outcome, Rows, Sink};
+use crate::{
+	backend::{Backend, Cancel, Collect, Outcome, Rows, Sink},
+	catalog::Catalog,
+};
 
 /// Work for the thread.
 pub enum Job {
-	/// Run a batch and keep up to `limit` rows.
-	Query { sql: String, limit: usize },
-	/// Run a batch and write every row to a CSV file.
+	/// Run batches in order, keeping up to `limit` rows per result set.
+	Run { batches: Vec<String>, limit: usize },
+	/// Run a statement and write every row to a CSV file.
 	Export { sql: String, path: PathBuf },
-	/// Switch database and list its tables.
+	/// Switch database, then load its catalog.
 	Switch(String),
+	/// Load the current database's catalog.
+	Catalog,
+}
+
+/// Everything a script run produced.
+pub struct RunResult {
+	/// Result sets in order.
+	pub sets:     Vec<Rows>,
+	/// Lines for the Messages tab, in order.
+	pub messages: Vec<String>,
+	/// Wall time.
+	pub ms:       u128,
+	/// The error that stopped the run.
+	pub error:    Option<String>,
 }
 
 /// What a job produced. Errors are display text.
 pub enum Reply {
-	/// A query finished.
-	Rows(Result<Rows, String>, u128),
+	/// A script finished.
+	Ran(RunResult),
 	/// An export finished: the file and its row count.
 	Exported(Result<(PathBuf, usize), String>),
-	/// A database switch finished: the name and its tables.
-	Switched(String, Result<Vec<String>, String>),
+	/// A database switch finished: the name and its catalog.
+	Switched(String, Result<Catalog, String>),
+	/// The catalog was (re)loaded.
+	Catalog(Result<Catalog, String>),
 	/// The job was cancelled and the connection replaced.
 	Cancelled,
 }
@@ -72,14 +91,9 @@ impl Worker {
 /// Runs one job to its reply.
 fn run<B: Backend>(db: &mut B, job: Job, cancel: &Cancel) -> Reply {
 	match job {
-		Job::Query { sql, limit } => {
-			let started = Instant::now();
-			let mut sink = Collect::new(limit);
-			match db.stream(&sql, cancel, &mut sink) {
-				Ok(Outcome::Done) => Reply::Rows(Ok(sink.rows), started.elapsed().as_millis()),
-				Ok(Outcome::Cancelled) => Reply::Cancelled,
-				Err(e) => Reply::Rows(Err(format!("{e:#}")), started.elapsed().as_millis()),
-			}
+		Job::Run { batches, limit } => match script(db, &batches, limit, cancel) {
+			Some(r) => Reply::Ran(r),
+			None => Reply::Cancelled,
 		},
 		Job::Export { sql, path } => match export(db, &sql, &path, cancel) {
 			Ok(Some(n)) => Reply::Exported(Ok((path, n))),
@@ -93,10 +107,48 @@ fn run<B: Backend>(db: &mut B, job: Job, cancel: &Cancel) -> Reply {
 			},
 		},
 		Job::Switch(name) => {
-			let result = db.use_database(&name).and_then(|()| db.tables());
+			let result = db.use_database(&name).and_then(|()| Catalog::load(db));
 			Reply::Switched(name, result.map_err(|e| format!("{e:#}")))
 		},
+		Job::Catalog => Reply::Catalog(Catalog::load(db).map_err(|e| format!("{e:#}"))),
 	}
+}
+
+/// Runs batches until one fails. `None` when cancelled.
+fn script<B: Backend>(db: &mut B, batches: &[String], limit: usize, cancel: &Cancel) -> Option<RunResult> {
+	let started = Instant::now();
+	let mut sink = Collect::new(limit);
+	let mut messages = Vec::new();
+	let mut error = None;
+	for sql in batches {
+		let (sets_before, aff_before) = (sink.sets.len(), sink.affected.len());
+		match db.stream(sql, cancel, &mut sink) {
+			Ok(Outcome::Done) => {},
+			Ok(Outcome::Cancelled) => return None,
+			Err(e) => {
+				error = Some(format!("{e:#}"));
+				break;
+			},
+		}
+		for set in &sink.sets[sets_before..] {
+			messages.push(format!("({} row{} returned{})", set.rows.len(), plural(set.rows.len()), if set.capped { ", capped; later results skipped" } else { "" }));
+		}
+		for n in &sink.affected[aff_before..] {
+			messages.push(format!("({n} row{} affected)", plural(*n as usize)));
+		}
+		if sink.sets.len() == sets_before && sink.affected.len() == aff_before {
+			messages.push("Commands completed successfully.".to_owned());
+		}
+	}
+	if let Some(e) = &error {
+		messages.push(e.clone());
+	}
+	Some(RunResult { sets: sink.sets, messages, ms: started.elapsed().as_millis(), error })
+}
+
+/// `s` unless `n` is one.
+const fn plural(n: usize) -> &'static str {
+	if n == 1 { "" } else { "s" }
 }
 
 /// One CSV field: quoted when it holds a comma, quote or line break.
@@ -140,7 +192,7 @@ impl Sink for Csv {
 	}
 }
 
-/// Streams a batch to `path`. `None` when cancelled.
+/// Streams a statement to `path`. `None` when cancelled.
 fn export<B: Backend>(db: &mut B, sql: &str, path: &PathBuf, cancel: &Cancel) -> anyhow::Result<Option<usize>> {
 	let mut csv = Csv { out: BufWriter::new(File::create(path)?), rows: 0, error: None };
 	let outcome = db.stream(sql, cancel, &mut csv)?;

@@ -6,7 +6,7 @@ use std::{future::poll_fn, pin::Pin};
 use anyhow::Context;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use futures_core::Stream;
-use tiberius::{Client, ColumnData, Config, FromSql};
+use tiberius::{Client, ColumnData, Config, FromSql, QueryItem, error::Error as TdsError};
 use tokio::{net::TcpStream, runtime::Runtime};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -105,18 +105,26 @@ impl Backend for Mssql {
 
 	fn stream(&mut self, sql: &str, cancel: &Cancel, sink: &mut dyn Sink) -> anyhow::Result<Outcome> {
 		let client = &mut self.client;
+		let dml = is_dml(sql);
 		let outcome = self.rt.block_on(async {
 			let run = async {
-				let mut stream = client.simple_query(sql).await?;
-				if let Some(cols) = stream.columns().await? {
-					let names: Vec<String> = cols.iter().map(|c| c.name().to_owned()).collect();
-					sink.columns(&names);
+				if dml {
+					let done = client.execute(sql, &[]).await.map_err(pretty)?;
+					sink.affected(done.total());
+					return anyhow::Ok(());
 				}
-				let mut rows = stream.into_row_stream();
-				while let Some(row) = next(&mut rows).await {
-					let row = row?;
-					if !sink.row(row.into_iter().map(|d| cell(&d)).collect()) {
-						break;
+				let mut stream = client.simple_query(sql).await.map_err(pretty)?;
+				while let Some(item) = next(&mut stream).await {
+					match item.map_err(pretty)? {
+						QueryItem::Metadata(m) => {
+							let names: Vec<String> = m.columns().iter().map(|c| c.name().to_owned()).collect();
+							sink.columns(&names);
+						},
+						QueryItem::Row(row) => {
+							if !sink.row(row.into_iter().map(|d| cell(&d)).collect()) {
+								break;
+							}
+						},
 					}
 				}
 				anyhow::Ok(())
@@ -131,4 +139,28 @@ impl Backend for Mssql {
 		}
 		Ok(outcome)
 	}
+}
+
+/// A server error as SSMS prints it: `Msg 208, Level 16, State 1, Line 3: text`.
+fn pretty(e: TdsError) -> anyhow::Error {
+	match e {
+		TdsError::Server(t) => anyhow::anyhow!(
+			"Msg {}, Level {}, State {}, Line {}: {}",
+			t.code(),
+			t.class(),
+			t.state(),
+			t.line(),
+			t.message()
+		),
+		other => other.into(),
+	}
+}
+
+/// Does the batch start with a statement that changes rows and returns none?
+fn is_dml(sql: &str) -> bool {
+	let toks = crate::tsql::lex(sql);
+	let Some(first) = toks.iter().find(|t| t.kind != crate::tsql::Kind::Comment) else { return false };
+	let word = first.text(sql).to_uppercase();
+	matches!(word.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+		&& !toks.iter().any(|t| t.text(sql).eq_ignore_ascii_case("output"))
 }

@@ -1,14 +1,19 @@
-//! `tern-mssql [PROFILE]`: the interactive client (a picker when PROFILE is omitted).
+//! `tern-mssql [PROFILE] [FILE.sql...]`: the interactive client (a picker when PROFILE is omitted).
 //! `tern-mssql query PROFILE SQL`: one batch printed as a table.
 //! `tern-mssql profiles`: the saved profiles.
 
 mod app;
 mod backend;
+mod catalog;
+mod complete;
 mod guard;
 mod profile;
+mod tsql;
 mod worker;
 
-use anyhow::{Context, bail};
+use std::path::PathBuf;
+
+use anyhow::Context;
 use backend::{Backend, Rows, mssql::Mssql};
 use tern_sdk::{
 	PrintOptions,
@@ -32,14 +37,15 @@ fn view(rows: &Rows) -> View {
 		.child(html::tbody().children(body))])
 }
 
-/// The named profile, connected.
-fn connect(name: &str) -> anyhow::Result<Mssql> {
+/// The named profile, connected, with its server name.
+fn connect(name: &str) -> anyhow::Result<(Mssql, String)> {
 	let profiles = profile::load()?;
 	let p = profiles
 		.iter()
 		.find(|p| p.name == name)
 		.with_context(|| format!("no profile named {name}"))?;
-	Mssql::connect(&p.ado()?).with_context(|| format!("connecting to {}", p.server))
+	let db = Mssql::connect(&p.ado()?).with_context(|| format!("connecting to {}", p.server))?;
+	Ok((db, p.server.clone()))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,14 +58,18 @@ fn main() -> anyhow::Result<()> {
 			Ok(())
 		},
 		["query", name, sql] => {
-			let rows = connect(name)?.query(sql, 1000)?;
+			let rows = connect(name)?.0.query(sql, 1000)?;
 			tern_sdk::print(view(&rows), PrintOptions::new().css(CSS))?;
 			if rows.capped {
 				eprintln!("(capped at 1000 rows)");
 			}
 			Ok(())
 		},
-		[name] => app::run(connect(name)?, (*name).to_owned()),
+		[name, files @ ..] => {
+			let (db, server) = connect(name)?;
+			let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+			app::run(db, (*name).to_owned(), server, &files)
+		},
 		[] => {
 			let profiles = profile::load()?;
 			let rows: Vec<(String, String)> = profiles
@@ -67,13 +77,12 @@ fn main() -> anyhow::Result<()> {
 				.map(|p| (p.name.clone(), format!("{}  {}", p.server, p.user)))
 				.collect();
 			match app::pick(&rows)? {
-				Some(name) => app::run(connect(&name)?, name),
+				Some(name) => {
+					let (db, server) = connect(&name)?;
+					app::run(db, name, server, &[])
+				},
 				None => Ok(()),
 			}
 		},
-		_ => bail!(
-			"usage: tern-mssql PROFILE | query PROFILE SQL | profiles   (profiles: {})",
-			profile::path().display()
-		),
 	}
 }
