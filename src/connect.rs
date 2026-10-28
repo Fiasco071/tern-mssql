@@ -1,9 +1,10 @@
 //! The connection manager shown when no profile is named: list, add, edit,
-//! delete and test saved connections, then connect.
+//! delete and test saved connections, then connect. Everything is clickable;
+//! the keyboard does the same things.
 
 use tern_sdk::{
 	Input, Options, Session, SurfaceOptions,
-	ui::{self, View},
+	ui::{self, View, html},
 };
 
 use crate::{
@@ -11,11 +12,34 @@ use crate::{
 	profile::{self, Profile},
 };
 
-/// What the list reports.
+/// What a click or key asks for.
 #[derive(Clone, Debug)]
 enum Pick {
-	/// A row was activated: its key.
-	Chosen(String),
+	/// Select a saved connection.
+	Row(usize),
+	/// Connect to a saved connection.
+	Connect(usize),
+	New,
+	Edit,
+	DeleteAsk,
+	DeleteYes,
+	DeleteNo,
+	Quit,
+	/// Make a form row the one that takes typing.
+	Field(usize),
+	/// Fields (false) or connection string (true).
+	SetString(bool),
+	ToggleTrust,
+	Save,
+	Test,
+	Cancel,
+}
+
+/// What the loop does next.
+enum Flow {
+	Stay,
+	Connect(String),
+	Quit,
 }
 
 /// Form fields, in order (the connection string is held apart).
@@ -262,7 +286,7 @@ fn masked(cs: &str) -> String {
 enum Mode {
 	List,
 	Form(Form),
-	/// Waiting for `y` to delete the selected connection.
+	/// Waiting for a yes to delete the selected connection.
 	Delete,
 }
 
@@ -271,60 +295,160 @@ struct State {
 	at:       usize,
 	mode:     Mode,
 	note:     String,
+	/// The note reports a problem.
+	bad:      bool,
+}
+
+const CSS: &str = "\
+.cm{padding:10px 14px;font-family:Geist,system-ui,sans-serif;font-size:12.9px}\
+.ct{font-weight:700;font-size:15px;margin:2px 0 10px}\
+.cl{border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:4px}\
+.cr{display:flex;align-items:center;gap:14px;height:32px;box-sizing:border-box;padding:0 12px;border-radius:5px;border:1px solid transparent;cursor:pointer}\
+.cr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
+.cr.sel{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent);border-color:var(--sf-c-accent)}\
+.cn{font-weight:600;min-width:130px}.cd{color:var(--sf-c-muted)}\
+.bar{display:flex;align-items:center;gap:10px;margin-top:12px}\
+.bt{display:inline-flex;align-items:center;height:28px;box-sizing:border-box;padding:0 16px;border-radius:6px;border:1px solid var(--sf-c-accent);color:var(--sf-c-accent);cursor:pointer;white-space:nowrap}\
+.bt:hover{background:color-mix(in srgb,var(--sf-c-accent) 20%,transparent)}\
+.bt.pri{background:color-mix(in srgb,var(--sf-c-accent) 32%,transparent);color:inherit;font-weight:600}\
+.bt.bad{border-color:var(--sf-bad);color:var(--sf-bad)}\
+.fr{display:flex;align-items:center;gap:14px;min-height:36px;box-sizing:border-box;padding:2px 10px;margin:2px 0;border-radius:6px;border:1px solid transparent;cursor:pointer}\
+.fr:hover{background:color-mix(in srgb,var(--sf-c-muted) 10%,transparent)}\
+.fr.on{border-color:var(--sf-c-accent);background:color-mix(in srgb,var(--sf-c-accent) 12%,transparent)}\
+.fl{width:150px;color:var(--sf-c-muted)}.fr.on .fl{color:var(--sf-c-accent);font-weight:600}\
+.fv{flex:1;min-height:22px;box-sizing:border-box;padding:3px 10px;border-radius:5px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);white-space:nowrap;overflow:hidden}\
+.fr.on .fv{border-color:var(--sf-c-accent);background:color-mix(in srgb,#000 30%,transparent)}\
+.cu{color:var(--sf-c-accent)}\
+.seg{display:inline-flex;border:1px solid var(--sf-c-accent);border-radius:6px;overflow:hidden}\
+.sg{padding:4px 14px;cursor:pointer;color:var(--sf-c-muted)}.sg:hover{color:inherit}\
+.sg.on{background:color-mix(in srgb,var(--sf-c-accent) 32%,transparent);color:inherit;font-weight:600}\
+.ck{display:inline-flex;align-items:center;gap:8px;cursor:pointer}.ck .bx{width:16px;text-align:center;color:var(--sf-c-accent);font-size:15px}\
+.nt{margin-top:10px;color:var(--sf-c-muted)}.nt.bad{color:var(--sf-bad)}\
+.hp{margin-top:12px;color:var(--sf-c-muted);font-size:12px}";
+
+fn button(label: &str, class: &str, msg: Pick) -> html::El<Pick> {
+	html::span(label.to_owned()).class(format!("bt {class}")).on_click(msg)
 }
 
 /// The saved connections or the form.
 fn view(s: &State) -> View<Pick> {
-	let mut list = ui::list::<Pick>().key("profiles").on_activate(|id| Pick::Chosen(id.to_owned()));
-	let help;
+	let mut page = html::div().class("cm");
+	let title = match &s.mode {
+		Mode::Form(f) if f.original.is_some() => "Edit connection",
+		Mode::Form(_) => "New connection",
+		_ => "Connect to",
+	};
+	page = page.child(html::div().class("ct").child(html::span(title)));
 	match &s.mode {
 		Mode::Form(f) => {
-			list = list.selected(format!("f{}", f.at));
 			for (i, row) in f.rows().iter().enumerate() {
-				let (label, mut v, icon) = match row {
-					Row::Mode => ("Mode", if f.string { "Connection string" } else { "Fields" }.to_owned(), "settings"),
-					Row::ConnString => ("Connection string", masked(&f.cs), "tag"),
-					Row::Password => ("Password", if f.literal().is_some() { "*".repeat(f.values[PASSWORD].chars().count()) } else { f.values[PASSWORD].clone() }, "key"),
-					Row::Name => (LABELS[NAME], f.values[NAME].clone(), "tag"),
-					Row::Server => (LABELS[1], f.values[1].clone(), "tag"),
-					Row::Port => (LABELS[PORT], f.values[PORT].clone(), "tag"),
-					Row::User => (LABELS[3], f.values[3].clone(), "tag"),
-					Row::Database => (LABELS[5], f.values[5].clone(), "tag"),
-					Row::Trust => (LABELS[TRUST], f.values[TRUST].clone(), "tag"),
+				let on = i == f.at;
+				let mut line = html::div().class(if on { "fr on" } else { "fr" }).on_click(Pick::Field(i));
+				let label = match row {
+					Row::Mode => "Enter as",
+					Row::ConnString => "Connection string",
+					Row::Password => "Password",
+					Row::Name => LABELS[NAME],
+					Row::Server => LABELS[1],
+					Row::Port => LABELS[PORT],
+					Row::User => LABELS[3],
+					Row::Database => LABELS[5],
+					Row::Trust => "Certificate",
 				};
-				if i == f.at && !matches!(row, Row::Mode | Row::Trust) {
-					v.push('|');
-				}
-				list = list.child(ui::item(label).key(format!("f{i}")).detail(v).icon(icon));
+				line = line.child(html::span(label).class("fl"));
+				line = match row {
+					Row::Mode => line.child(
+						html::div()
+							.class("seg")
+							.child(html::span("Fields").class(if f.string { "sg" } else { "sg on" }).on_click(Pick::SetString(false)))
+							.child(html::span("Connection string").class(if f.string { "sg on" } else { "sg" }).on_click(Pick::SetString(true))),
+					),
+					Row::Trust => line.child(
+						html::div()
+							.class("ck")
+							.on_click(Pick::ToggleTrust)
+							.child(html::span(if f.values[TRUST] == "yes" { "\u{2611}" } else { "\u{2610}" }).class("bx"))
+							.child(html::span("Trust the server certificate")),
+					),
+					_ => {
+						let mut shown = match row {
+							Row::ConnString => masked(&f.cs),
+							Row::Password if f.literal().is_some() => "*".repeat(f.values[PASSWORD].chars().count()),
+							Row::Password => f.values[PASSWORD].clone(),
+							Row::Name => f.values[NAME].clone(),
+							Row::Server => f.values[1].clone(),
+							Row::Port => f.values[PORT].clone(),
+							Row::User => f.values[3].clone(),
+							_ => f.values[5].clone(),
+						};
+						if shown.is_empty() && !on {
+							shown = match row {
+								Row::Password => "stored in the OS credential store, or $ENVVAR".to_owned(),
+								Row::Database => "optional".to_owned(),
+								_ => String::new(),
+							};
+						}
+						let mut value = html::div().class("fv").child(html::span(shown));
+						if on {
+							value = value.child(html::span("\u{258f}").class("cu"));
+						}
+						line.child(value)
+					},
+				};
+				page = page.child(line);
 			}
-			help = "type to edit, tab/down next, up back, enter save, ctrl+t test, esc cancel. Mode: space switches between fields and a connection string. Password: type it (kept in the OS credential store) or $ENVVAR".to_owned();
+			page = page.child(
+				html::div()
+					.class("bar")
+					.child(button("Save", "pri", Pick::Save))
+					.child(button("Test connection", "", Pick::Test))
+					.child(button("Cancel", "", Pick::Cancel)),
+			);
+			page = page.child(html::div().class("hp").child(html::span("Click a field and type. Tab and the arrows move between fields. Enter saves, Esc cancels.")));
 		},
 		_ => {
-			if let Some(p) = s.profiles.get(s.at) {
-				list = list.selected(p.name.clone());
-			}
-			for p in &s.profiles {
-				list = list.child(ui::item(p.name.clone()).key(p.name.clone()).detail(format!("{}  {}", p.server, p.user)).icon("database"));
-			}
-			help = if matches!(s.mode, Mode::Delete) {
-				format!("delete {}? y to confirm, any other key cancels", s.profiles.get(s.at).map_or("", |p| p.name.as_str()))
-			} else if s.profiles.is_empty() {
-				"no connections yet: press n to add one".to_owned()
+			if s.profiles.is_empty() {
+				page = page.child(html::div().class("nt").child(html::span("No connections yet.")));
+				page = page.child(html::div().class("bar").child(button("New connection", "pri", Pick::New)).child(button("Quit", "", Pick::Quit)));
 			} else {
-				"enter connect, n new, e edit, d delete, esc quit".to_owned()
-			};
+				let mut list = html::div().class("cl");
+				for (i, p) in s.profiles.iter().enumerate() {
+					list = list.child(
+						html::div()
+							.class(if i == s.at { "cr sel" } else { "cr" })
+							.on_click(Pick::Row(i))
+							.on_dblclick(Pick::Connect(i))
+							.child(html::span(p.name.clone()).class("cn"))
+							.child(html::span(p.server.clone()).class("cd"))
+							.child(html::span(p.user.clone()).class("cd")),
+					);
+				}
+				page = page.child(list);
+				let name = s.profiles.get(s.at).map_or("", |p| p.name.as_str());
+				let bar = if matches!(s.mode, Mode::Delete) {
+					html::div()
+						.class("bar")
+						.child(html::span(format!("Delete {name}?")))
+						.child(button("Delete", "bad", Pick::DeleteYes))
+						.child(button("Keep it", "", Pick::DeleteNo))
+				} else {
+					html::div()
+						.class("bar")
+						.child(button("Connect", "pri", Pick::Connect(s.at)))
+						.child(button("New", "", Pick::New))
+						.child(button("Edit", "", Pick::Edit))
+						.child(button("Delete", "", Pick::DeleteAsk))
+						.child(button("Quit", "", Pick::Quit))
+				};
+				page = page.child(bar);
+				page = page.child(html::div().class("hp").child(html::span("Click a connection to select it, double-click to connect. Keys: enter, n, e, d, esc.")));
+			}
 		},
 	}
-	let title = match &s.mode {
-		Mode::Form(f) if f.original.is_some() => "**Edit connection**",
-		Mode::Form(_) => "**New connection**",
-		_ => "**Connect to**",
-	};
-	let mut col = ui::col().child(ui::md(title).key("h")).child(list).child(ui::md(help).key("help"));
 	if !s.note.is_empty() {
-		col = col.child(ui::md(s.note.clone()).key("note"));
+		page = page.child(html::div().class(if s.bad { "nt bad" } else { "nt" }).child(html::span(s.note.clone())));
 	}
-	View::new().main(col)
+	View::new().main(ui::col().key("cm").child(page))
 }
 
 /// Tries a connection and reports the outcome as display text.
@@ -371,17 +495,133 @@ fn save(s: &mut State, f: &Form) -> Result<String, String> {
 	Ok(format!("Saved {}", p.name))
 }
 
+/// Applies one request. The form is taken out of the state while it is saved or tested.
+fn handle(s: &mut State, p: Pick) -> Flow {
+	match p {
+		Pick::Row(i) => {
+			if !s.profiles.is_empty() && !matches!(s.mode, Mode::Form(_)) {
+				s.at = i.min(s.profiles.len() - 1);
+				s.mode = Mode::List;
+				s.note.clear();
+			}
+		},
+		Pick::Connect(i) => {
+			if let Some(p) = s.profiles.get(i).filter(|_| !matches!(s.mode, Mode::Form(_))) {
+				let name = p.name.clone();
+				s.at = i;
+				return Flow::Connect(name);
+			}
+		},
+		Pick::New => {
+			if !matches!(s.mode, Mode::Form(_)) {
+				s.mode = Mode::Form(Form::new(None));
+				s.note.clear();
+			}
+		},
+		Pick::Edit => {
+			if let Some(p) = s.profiles.get(s.at).filter(|_| !matches!(s.mode, Mode::Form(_))) {
+				s.mode = Mode::Form(Form::new(Some(p)));
+				s.note.clear();
+			}
+		},
+		Pick::DeleteAsk => {
+			if !s.profiles.is_empty() && matches!(s.mode, Mode::List) {
+				s.mode = Mode::Delete;
+				s.note.clear();
+			}
+		},
+		Pick::DeleteYes => {
+			if matches!(s.mode, Mode::Delete) && s.at < s.profiles.len() {
+				let gone = s.profiles.remove(s.at);
+				profile::forget_secret(&gone.name);
+				match profile::store(&s.profiles) {
+					Ok(()) => {
+						s.note = format!("Deleted {}", gone.name);
+						s.bad = false;
+					},
+					Err(e) => {
+						s.note = format!("{e:#}");
+						s.bad = true;
+					},
+				}
+				s.at = s.at.min(s.profiles.len().saturating_sub(1));
+			}
+			s.mode = Mode::List;
+		},
+		Pick::DeleteNo => s.mode = Mode::List,
+		Pick::Quit => return Flow::Quit,
+		Pick::Field(i) => {
+			if let Mode::Form(f) = &mut s.mode {
+				f.at = i.min(f.rows().len() - 1);
+			}
+		},
+		Pick::SetString(want) => {
+			let err = match &mut s.mode {
+				Mode::Form(f) if f.string != want => f.switch().err(),
+				_ => None,
+			};
+			if let Some(e) = err {
+				s.note = e;
+				s.bad = true;
+			}
+		},
+		Pick::ToggleTrust => {
+			if let Mode::Form(f) = &mut s.mode {
+				f.values[TRUST] = if f.values[TRUST] == "yes" { "no" } else { "yes" }.into();
+			}
+		},
+		Pick::Save => {
+			if let Mode::Form(f) = std::mem::replace(&mut s.mode, Mode::List) {
+				match save(s, &f) {
+					Ok(note) => {
+						s.note = note;
+						s.bad = false;
+					},
+					Err(e) => {
+						s.note = e;
+						s.bad = true;
+						s.mode = Mode::Form(f);
+					},
+				}
+			}
+		},
+		Pick::Test => {
+			if let Mode::Form(f) = &s.mode {
+				match f.built().and_then(|b| test(&b.profile, b.password.as_deref())) {
+					Ok(_) => {
+						s.note = "Connection works".into();
+						s.bad = false;
+					},
+					Err(e) => {
+						s.note = e;
+						s.bad = true;
+					},
+				}
+			}
+		},
+		Pick::Cancel => {
+			s.mode = Mode::List;
+			s.note.clear();
+			if s.profiles.is_empty() {
+				return Flow::Quit;
+			}
+		},
+	}
+	Flow::Stay
+}
+
 /// Shows the connections and returns a live connection with its profile name and server, or `None` on quit.
 pub fn choose(new: bool) -> anyhow::Result<Option<(Mssql, String, String)>> {
 	let Some(mut session) = Session::<Pick>::connect(Options::new())? else {
 		anyhow::bail!("pick a profile by name outside Tern: tern-mssql PROFILE");
 	};
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server"))?;
+	session.stylesheet(sf, "cm", Some(CSS))?;
 	let profiles = profile::load()?;
 	let mode = if new || profiles.is_empty() { Mode::Form(Form::new(None)) } else { Mode::List };
-	let mut s = State { profiles, at: 0, mode, note: String::new() };
+	let mut s = State { profiles, at: 0, mode, note: String::new(), bad: false };
 	session.render(sf, view(&s))?;
-	session.focus(sf, Some("main.profiles"))?;
+	session.focus(sf, None)?;
 	let chosen = loop {
 		let input = match session.next(None) {
 			Ok(Some(i)) => i,
@@ -389,89 +629,71 @@ pub fn choose(new: bool) -> anyhow::Result<Option<(Mssql, String, String)>> {
 			Err(tern_sdk::Error::InputClosed) => break None,
 			Err(e) => return Err(e.into()),
 		};
-		let mut connect = None;
-		match input {
-			Input::Msg(Pick::Chosen(id), _) if matches!(s.mode, Mode::List) => connect = Some(id),
-			Input::Key(k) => match std::mem::replace(&mut s.mode, Mode::List) {
-				Mode::Form(mut f) => {
-					if k.is("escape") {
-						s.mode = Mode::List;
-						s.note.clear();
-						if s.profiles.is_empty() {
-							break None;
-						}
-					} else if k.is("enter") {
-						match save(&mut s, &f) {
-							Ok(note) => {
-								s.note = note;
-								s.mode = Mode::List;
-							},
-							Err(e) => {
-								s.note = e;
-								s.mode = Mode::Form(f);
-							},
-						}
-					} else if k.is("ctrl+t") {
-						s.note = match f.built().and_then(|b| test(&b.profile, b.password.as_deref())) {
-							Ok(_) => "Connection works".into(),
-							Err(e) => e,
-						};
-						s.mode = Mode::Form(f);
-					} else {
-						s.note = f.key(&k).unwrap_or_default();
-						s.mode = Mode::Form(f);
-					}
-				},
-				Mode::Delete => {
-					if k.typed() == Some("y") && s.at < s.profiles.len() {
-						let gone = s.profiles.remove(s.at);
-						profile::forget_secret(&gone.name);
-						s.note = match profile::store(&s.profiles) {
-							Ok(()) => format!("Deleted {}", gone.name),
-							Err(e) => format!("{e:#}"),
-						};
-						s.at = s.at.min(s.profiles.len().saturating_sub(1));
-					}
-				},
-				Mode::List => {
-					s.note.clear();
-					if k.is("escape") || k.is("ctrl+q") || k.is("ctrl+c") {
-						break None;
-					}
-					match (k.name.as_str(), k.typed()) {
-						("enter", _) => connect = s.profiles.get(s.at).map(|p| p.name.clone()),
-						("down", _) => s.at = (s.at + 1).min(s.profiles.len().saturating_sub(1)),
-						("up", _) => s.at = s.at.saturating_sub(1),
-						(_, Some("n")) => s.mode = Mode::Form(Form::new(None)),
-						(_, Some("e")) => {
-							if let Some(p) = s.profiles.get(s.at) {
-								s.mode = Mode::Form(Form::new(Some(p)));
-							}
-						},
-						(_, Some("d")) if !s.profiles.is_empty() => s.mode = Mode::Delete,
-						_ => {},
-					}
-				},
-			},
+		let pick = match input {
+			Input::Msg(p, _) => Some(p),
+			Input::Key(k) => key_pick(&mut s, &k),
 			_ => continue,
-		}
-		if let Some(name) = connect {
-			if let Some(i) = s.profiles.iter().position(|p| p.name == name) {
-				s.at = i;
-			}
-			s.note = format!("Connecting to {name}...");
-			session.render(sf, view(&s))?;
-			let p = s.profiles[s.at].clone();
-			match test(&p, None) {
-				Ok(db) => break Some((db, p.name, p.server)),
-				Err(e) => s.note = e,
+		};
+		if let Some(p) = pick {
+			match handle(&mut s, p) {
+				Flow::Stay => {},
+				Flow::Quit => break None,
+				Flow::Connect(name) => {
+					s.note = format!("Connecting to {name}...");
+					s.bad = false;
+					session.render(sf, view(&s))?;
+					let p = s.profiles[s.at].clone();
+					match test(&p, None) {
+						Ok(db) => break Some((db, p.name, p.server)),
+						Err(e) => {
+							s.note = e;
+							s.bad = true;
+						},
+					}
+				},
 			}
 		}
 		session.render(sf, view(&s))?;
-		session.focus(sf, Some("main.profiles"))?;
+		session.focus(sf, None)?;
 	};
 	session.close()?;
 	Ok(chosen)
+}
+
+/// A key as a request. Typing in the form edits it directly and asks for nothing.
+fn key_pick(s: &mut State, k: &tern_sdk::keys::Key) -> Option<Pick> {
+	match &mut s.mode {
+		Mode::Form(f) => {
+			if k.is("escape") {
+				Some(Pick::Cancel)
+			} else if k.is("enter") {
+				Some(Pick::Save)
+			} else if k.is("ctrl+t") {
+				Some(Pick::Test)
+			} else {
+				let msg = f.key(k);
+				s.bad = msg.is_some();
+				s.note = msg.unwrap_or_default();
+				None
+			}
+		},
+		Mode::Delete => Some(if k.typed().is_some_and(|t| t.eq_ignore_ascii_case("y")) { Pick::DeleteYes } else { Pick::DeleteNo }),
+		Mode::List => {
+			s.note.clear();
+			if k.is("escape") || k.is("ctrl+q") || k.is("ctrl+c") {
+				return Some(Pick::Quit);
+			}
+			match (k.name.as_str(), k.typed()) {
+				("enter", _) => Some(Pick::Connect(s.at)),
+				("down", _) => Some(Pick::Row((s.at + 1).min(s.profiles.len().saturating_sub(1)))),
+				("up", _) => Some(Pick::Row(s.at.saturating_sub(1))),
+				(_, Some("n")) => Some(Pick::New),
+				(_, Some("e")) => Some(Pick::Edit),
+				(_, Some("d")) => Some(Pick::DeleteAsk),
+				_ => None,
+			}
+		},
+	}
 }
 
 #[cfg(test)]
