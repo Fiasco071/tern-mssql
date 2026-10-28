@@ -10,7 +10,7 @@ local EXPLORER_SHARE = 0.22
 
 local function launch(cx: WindowCx, command: string, how: "tab" | "split")
 	if how == "split" then
-		local pane = cx.layout:focused()
+		local pane = cx.session:focused()
 		if pane then
 			cx.layout:split(pane, "right", { command = command })
 			return
@@ -34,7 +34,7 @@ tern.command({
 			{ launch = { command = "tern-mssql waiting" } },
 		})
 		-- Focus starts on the explorer (the left leaf), whichever pane Tern picked.
-		local layout = if tab then cx.layout:layout(tab) else nil
+		local layout = if tab then cx.session:layout(tab) else nil
 		local left = if layout then layout.root[1] else nil
 		if left and left.pane then
 			cx.layout:focus(left.pane)
