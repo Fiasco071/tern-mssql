@@ -53,6 +53,20 @@ fn connect(name: &str) -> anyhow::Result<(Mssql, String)> {
 
 fn main() -> anyhow::Result<()> {
 	let args: Vec<String> = std::env::args().skip(1).collect();
+	// `--trace FILE` logs every input the client receives, for diagnosing what Tern sends.
+	let (args, trace) = match args.iter().position(|a| a == "--trace") {
+		Some(i) if i + 1 < args.len() => {
+			let mut rest = args.clone();
+			let file = rest.remove(i + 1);
+			rest.remove(i);
+			(rest, Some(file))
+		},
+		_ => (args, None),
+	};
+	if let Some(file) = trace {
+		// Nothing else is running yet, so setting the environment is safe.
+		unsafe { std::env::set_var("TERN_MSSQL_TRACE", file) };
+	}
 	match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
 		["profiles"] => {
 			for p in profile::load()? {

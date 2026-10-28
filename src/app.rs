@@ -27,20 +27,22 @@ const LIMIT: usize = 1000;
 const POPUP_ROWS: usize = 8;
 /// Rows drawn per result set.
 const RENDER_ROWS: usize = 200;
-/// The query editor's id.
-const EDITOR: &str = "main.body.work.ed";
-/// The explorer's id.
-const TREE: &str = "main.body.tree";
+/// Explorer widths the divider cycles through, as fractions of the window.
+const SIDES: [f64; 4] = [0.16, 0.24, 0.32, 0.42];
 /// Separates the parts of an object id (database names can hold dots).
 const SEP: char = '\u{1f}';
 
 /// What node handlers report.
 #[derive(Clone, Debug)]
 enum Msg {
-	/// A tree row was activated.
+	/// A tree row was double-clicked.
 	Activate(String),
-	/// A tree row was folded or unfolded (the event says which).
-	Toggle,
+	/// A tree row's chevron was clicked.
+	Fold(String),
+	/// A "Script as" item on an object row.
+	ScriptRow(String, script::Kind),
+	/// A database menu item on a database row.
+	DbRow(String, DbAct),
 	/// Native editing changed the buffer.
 	Edit(wire::Edit),
 	/// Undo was asked for.
@@ -63,14 +65,12 @@ enum Msg {
 	GridAll,
 	/// An explorer row was selected.
 	TreeSel(String),
-	/// A "Script as" menu item was picked.
-	Script(script::Kind),
 	/// The new-tab menu item or the + tab was picked.
 	NewTab,
 	/// The close-tab menu item was picked.
 	CloseTab,
-	/// A database menu item was picked.
-	Db(DbAct),
+	/// The divider was clicked: the next explorer width.
+	Widen,
 }
 
 /// What the explorer's database menu items do.
@@ -406,6 +406,12 @@ struct App {
 	picked: Option<String>,
 	/// The popup position last sent as a stylesheet.
 	pop_css: String,
+	/// Bumped to give the editor a fresh identity (and our text) when it and we disagree.
+	epoch: u32,
+	/// Index into `SIDES`.
+	side: usize,
+	/// Width and height of a character cell, in CSS pixels.
+	cell: (f64, f64),
 	/// The pane's height in rows, which the layout bounds are shares of.
 	rows: f64,
 	/// Native `edit` events seen; while zero, plain keys edit the buffer.
@@ -467,6 +473,9 @@ impl App {
 			picked: None,
 			pop_css: String::new(),
 			rows: pane_rows().unwrap_or(40.0),
+			epoch: 0,
+			side: 1,
+			cell: (10.0, 20.0),
 			native: 0,
 			grid_focus: false,
 		};
@@ -485,6 +494,11 @@ impl App {
 			return;
 		}
 		self.start(Job::Catalog(db.to_owned()), "loading objects");
+	}
+
+	/// The editor's node id.
+	fn editor_id(&self) -> String {
+		format!("main.body.work.ed{}", self.epoch)
 	}
 
 	fn buf(&mut self) -> &mut Buffer {
@@ -738,8 +752,8 @@ impl App {
 		b.dirty = true;
 	}
 
-	/// The explorer, styled like the file explorer: every database opens and closes, an icon per kind, the editor's database marked.
-	fn explorer(&self) -> ui::Tree<Msg> {
+	/// The explorer's root item, with every database under it.
+	fn explorer_root(&self) -> TreeItem {
 		let open = |id: &str| self.expanded.contains(id);
 		let mut srv = TreeItem::new("srv", vec![span(self.profile.clone(), "strong"), span(format!("  {}", self.server), "dim")])
 			.open(open("srv"));
@@ -753,31 +767,127 @@ impl App {
 				Some(cat) => self.catalog_items(d, cat),
 				None => {
 					// A child keeps the chevron; opening the database loads its objects.
-					let (text, icon) = if self.loading.contains(d) { ("loading objects...", "timer") } else { ("...", "more") };
-					let mut placeholder = TreeItem::new(format!("p:{id}"), vec![span(text, "dim")]);
-					placeholder.icon = Some(icon.into());
-					vec![placeholder]
+					let text = if self.loading.contains(d) { "loading objects..." } else { "..." };
+					vec![TreeItem::new(format!("p:{id}"), vec![span(text, "dim")])]
 				},
 			};
 			srv = srv.child(item);
 		}
-		let mut tree = ui::tree()
-			.key("tree")
-			.basis(0.24)
+		srv
+	}
+
+	/// The rows showing now, each with its depth.
+	fn visible<'a>(item: &'a TreeItem, depth: usize, out: &mut Vec<(&'a TreeItem, usize)>) {
+		out.push((item, depth));
+		if item.open.unwrap_or(false) {
+			for c in &item.children {
+				Self::visible(c, depth + 1, out);
+			}
+		}
+	}
+
+	/// The explorer: every row is an `el`, so each can carry its own right-click menu.
+	fn explorer(&self) -> ui::Col<Msg> {
+		let root = self.explorer_root();
+		let mut shown = Vec::new();
+		Self::visible(&root, 0, &mut shown);
+		let rows = shown.into_iter().map(|(item, depth)| {
+			let id = item.id.clone();
+			let has_kids = !item.children.is_empty();
+			let icon = serde_json::to_value(&item.icon).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+			let glyph = match icon.as_str() {
+				"server" => "⌂",
+				"database" => "◉",
+				"grid" => "▦",
+				"eye" => "◎",
+				"code" => "ƒ",
+				"braces" => "λ",
+				"folder" | "folder-open" => "▪",
+				_ => "·",
+			};
+			let mut row = html::div()
+				.class(format!("tr d{}{}", depth.min(5), if self.picked.as_deref() == Some(id.as_str()) { " cur" } else { "" }))
+				.on_click(Msg::TreeSel(id.clone()))
+				.on_dblclick(Msg::Activate(id.clone()))
+				.child(html::span(if has_kids { if item.open.unwrap_or(false) { "▾" } else { "▸" } } else { " " }).class("tc").on_click(Msg::Fold(id.clone())))
+				.child(html::span(glyph).class("ti"));
+			for (text, style) in label_parts(&item.label) {
+				row = row.child(html::span(text).class(format!("s-{}", if style.is_empty() { "plain" } else { style.as_str() })));
+			}
+			if id.starts_with("db:") {
+				for (name, act) in [("New query on database", DbAct::NewQuery), ("Use database", DbAct::Use), ("Refresh database", DbAct::Refresh)] {
+					row = row.on_menu(name, Msg::DbRow(id.clone(), act));
+				}
+			} else if id.starts_with("o:") {
+				for kind in [script::Kind::Select, script::Kind::Insert, script::Kind::Update, script::Kind::Delete, script::Kind::Create] {
+					row = row.on_menu(kind.act(), Msg::ScriptRow(id.clone(), kind));
+				}
+			}
+			row
+		});
+		ui::col()
+			.key("side")
+			.basis(SIDES[self.side])
 			.grow(0.0)
 			.shrink(1.0)
 			.min(ui::Bound::h(ui::Extent::Lines(0.0)))
 			.max(ui::Bound::h(ui::Extent::Lines(self.rows - 3.0)))
-			.on_select(|id| Msg::TreeSel(id.to_owned()))
-			.on_activate(|id| Msg::Activate(id.to_owned()))
-			.on_toggle(|_| Msg::Toggle);
-		for kind in [script::Kind::Select, script::Kind::Insert, script::Kind::Update, script::Kind::Delete, script::Kind::Create] {
-			tree = tree.on_menu(kind.act(), Msg::Script(kind));
+			.child(html::div().class("tree").children(rows))
+	}
+
+	/// Keys while the explorer has focus: arrows move and fold, enter opens. False when the key is not for the explorer.
+	fn tree_key(&mut self, key: &tern_sdk::keys::Key) -> bool {
+		let root = self.explorer_root();
+		let mut shown = Vec::new();
+		Self::visible(&root, 0, &mut shown);
+		let at = self.picked.as_deref().and_then(|p| shown.iter().position(|(i, _)| i.id == p));
+		let go = |n: usize| shown.get(n).map(|(i, _)| i.id.clone());
+		match key.name.as_str() {
+			"down" => self.picked = go(at.map_or(0, |a| a + 1)).or(self.picked.take()),
+			"up" => self.picked = go(at.map_or(0, |a| a.saturating_sub(1))).or(self.picked.take()),
+			"right" | "left" => {
+				let Some((item, depth)) = at.and_then(|a| shown.get(a)).copied() else { return true };
+				let open = item.open.unwrap_or(false);
+				let id = item.id.clone();
+				if key.name == "right" && !open && !item.children.is_empty() {
+					self.fold(&id);
+				} else if key.name == "left" && open {
+					self.fold(&id);
+				} else if key.name == "left" {
+					// To the parent: the nearest row above with a smaller depth.
+					let parent = shown[..at.unwrap_or(0)].iter().rev().find(|(_, d)| *d < depth).map(|(i, _)| i.id.clone());
+					self.picked = parent.or(self.picked.take());
+				} else if key.name == "right" {
+					self.picked = go(at.map_or(0, |a| a + 1)).or(self.picked.take());
+				}
+			},
+			"enter" => {
+				if let Some(id) = self.picked.clone() {
+					self.open_row(&id);
+				}
+			},
+			_ => return false,
 		}
-		for (name, act) in [("New query on database", DbAct::NewQuery), ("Use database", DbAct::Use), ("Refresh database", DbAct::Refresh)] {
-			tree = tree.on_menu(name, Msg::Db(act));
+		true
+	}
+
+	/// Folds or unfolds a row; opening a database loads its objects.
+	fn fold(&mut self, id: &str) {
+		if !self.expanded.remove(id) {
+			self.expanded.insert(id.to_owned());
+			if let Some(db) = id.strip_prefix("db:") {
+				self.ensure_catalog(db);
+			}
 		}
-		tree.item(srv)
+	}
+
+	/// A double click or enter on a row: folders fold, databases and objects open.
+	fn open_row(&mut self, id: &str) {
+		if id.starts_with("g:") || id == "srv" {
+			self.fold(id);
+		} else {
+			self.activate(id);
+		}
 	}
 
 	/// One database's folders and objects.
@@ -1010,7 +1120,7 @@ impl App {
 		tabs = tabs.tab("new", vec![span("+", "accent")]);
 		tabs = tabs.active(self.active.to_string());
 		let editor = ui::editor()
-			.key("ed")
+			.key(format!("ed{}", self.epoch))
 			.grow(1.0)
 			.min(ui::Bound::h(ui::Extent::Lines(4.0)))
 			.shrink(1.0)
@@ -1028,7 +1138,7 @@ impl App {
 		if let Some(pop) = self.popup_overlay() {
 			col = col.child(pop);
 		}
-		col.child(editor).child(ui::text(" ").key("gap").max(ui::Bound::h(ui::Extent::Lines(1.0)))).child(self.results())
+		col.child(editor).child(html::div().class("hsep")).child(self.results())
 	}
 
 
@@ -1064,7 +1174,7 @@ impl App {
 	fn view(&self) -> View<Msg> {
 		let b = &self.buffers[self.active];
 		let (line, col) = b.line_col();
-		let body = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(self.explorer()).child(self.work());
+		let body = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(self.explorer()).child(html::div().class("vsep").on_click(Msg::Widen)).child(self.work());
 		let catalog = self.catalog().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
 		let status = ui::status()
 			.key("bar")
@@ -1086,19 +1196,32 @@ impl App {
 /// The results grid: cells that select and copy like a spreadsheet's.
 const GRID_CSS: &str = "\
 .grid{border-collapse:collapse;font-variant-numeric:tabular-nums}\
+.grid th,.grid td{border:1px solid color-mix(in srgb,var(--sf-c-muted) 40%,transparent)}\
+.grid th{background:color-mix(in srgb,var(--sf-c-accent) 12%,#15171d)}\
+.grid tbody tr:nth-child(even) td:not(.sel){background:color-mix(in srgb,var(--sf-c-muted) 7%,transparent)}\
+.hsep{height:0;margin:3px 0}\
+.tree{overflow:auto;padding:2px 0}\
+.tr{display:flex;align-items:center;gap:6px;padding:3px 6px;white-space:nowrap;cursor:pointer;border-radius:4px}\
+.tr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
+.tr.cur{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent)}\
+.tc{width:12px;color:var(--sf-c-muted);text-align:center}\
+.ti{width:14px;text-align:center;color:var(--sf-c-muted)}\
+.d1{padding-left:20px}.d2{padding-left:34px}.d3{padding-left:48px}.d4{padding-left:62px}.d5{padding-left:76px}\
+.s-strong{font-weight:700}.s-accent{color:var(--sf-c-accent)}.s-dim{color:var(--sf-c-muted)}\
+.vsep{width:8px;align-self:stretch;cursor:col-resize}\
 .grid th{position:sticky;top:0;text-align:left;font-weight:600;padding:2px 14px 2px 8px;white-space:nowrap;cursor:pointer;color:var(--sf-c-muted)}\
 .grid td{padding:1px 14px 1px 8px;white-space:nowrap;cursor:cell}\
 .grid .rn{text-align:right;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
 .grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 26%,transparent)}\
 .grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
 .grid td.null{font-style:italic;color:var(--sf-c-muted)}\
-.gridwrap{overflow:auto;max-height:19em;max-height:15lh}\
+.gridwrap{overflow:auto}\
 .popwrap{position:relative;height:0;z-index:30}\
-.pop{position:absolute;margin:10px 0 0 14px;min-width:26ch;max-width:60ch;padding:2px 0;border:1px solid var(--sf-c-muted);border-radius:4px;background:color-mix(in srgb,var(--sf-c-accent) 8%,#15171d);box-shadow:0 4px 14px rgba(0,0,0,.5)}\
-.pi{display:flex;gap:1.2ch;padding:0 8px;white-space:nowrap;cursor:pointer}\
+.pop{position:absolute;min-width:260px;max-width:600px;padding:2px 0;border:1px solid var(--sf-c-muted);border-radius:4px;background:color-mix(in srgb,var(--sf-c-accent) 8%,#15171d);box-shadow:0 4px 14px rgba(0,0,0,.5)}\
+.pi{display:flex;gap:12px;padding:0 8px;white-space:nowrap;cursor:pointer}\
 .pi.cur{background:color-mix(in srgb,var(--sf-c-accent) 30%,transparent)}\
-.pk{color:var(--sf-c-accent);min-width:4ch;font-size:.85em}\
-.pd{color:var(--sf-c-muted);margin-left:auto;padding-left:2ch}";
+.pk{color:var(--sf-c-accent);min-width:40px;font-size:.85em}\
+.pd{color:var(--sf-c-muted);margin-left:auto;padding-left:20px}";
 
 /// Is shift held in a click event?
 fn shift_held(ev: &Event) -> bool {
@@ -1114,7 +1237,9 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server").role("sqlq"))?;
 	session.stylesheet(sf, "grid", Some(GRID_CSS))?;
 	draw(&mut session, sf, &mut app)?;
-	session.focus(sf, Some(EDITOR))?;
+	session.focus(sf, Some(app.editor_id().as_str()))?;
+	// TERN_MSSQL_TRACE=file logs every input, for diagnosing what Tern sends.
+	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
 		// Poll while jobs run so the clock ticks and replies show up; block when idle.
 		let wait = (!app.queue.is_empty()).then_some(Duration::from_millis(100));
@@ -1123,6 +1248,10 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 			Err(tern_sdk::Error::InputClosed) => break,
 			Err(e) => return Err(e.into()),
 		};
+		if let (Some(i), Some(log)) = (&input, &mut trace) {
+			let _ = std::io::Write::write_all(log, format!("{i:?}
+").as_bytes());
+		}
 		let changed = app.poll();
 		let Some(input) = input else {
 			if changed {
@@ -1137,7 +1266,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 					break;
 				} else if app.grid_focus && app.grid_key(&key) {
 					if !app.grid_focus {
-						session.focus(sf, Some(EDITOR))?;
+						session.focus(sf, Some(app.editor_id().as_str()))?;
 					}
 				} else if popup && key.is("escape") {
 					app.popup = None;
@@ -1158,6 +1287,8 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 					app.export();
 				} else if key.is("escape") || key.is("ctrl+x") {
 					app.cancel();
+				} else if key.alt && (key.name == "left" || key.name == "right") {
+					app.side = if key.name == "right" { (app.side + 1).min(SIDES.len() - 1) } else { app.side.saturating_sub(1) };
 				} else if key.is("f8") {
 					app.write = !app.write;
 				} else if key.is("ctrl+n") {
@@ -1168,16 +1299,24 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 					app.save();
 				} else if key.is("f6") {
 					app.in_editor = !app.in_editor;
-					session.focus(sf, Some(if app.in_editor { EDITOR } else { TREE }))?;
+					let id = app.editor_id();
+					session.focus(sf, app.in_editor.then_some(id.as_str()))?;
+				} else if !app.in_editor && !app.grid_focus {
+					app.tree_key(&key);
 				} else if app.native == 0 && !app.grid_focus && app.buf().key(&key) {
 					app.complete(false);
 				}
 			},
 			Input::Msg(Msg::Edit(e), _) => {
 				app.native += 1;
-				let ok = app.buf().apply(&e);
-				if ok {
+				if app.buf().apply(&e) {
 					app.complete(false);
+				} else {
+					// Tern's copy of the text and ours differ; a new editor identity makes Tern take ours instead of staying stuck.
+					app.epoch += 1;
+					app.popup = None;
+					app.note = "editor resynced".into();
+					session.focus(sf, Some(app.editor_id().as_str()))?;
 				}
 			},
 			Input::Msg(Msg::Undo, _) => {
@@ -1188,22 +1327,10 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				app.rows = pane_rows().unwrap_or(app.rows);
 				app.in_editor = true;
 				app.grid_focus = false;
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
-			Input::Msg(Msg::Activate(id), _) => app.activate(&id),
-			Input::Msg(Msg::Toggle, Event::Toggle(t)) => {
-				if let Some(id) = t.key.as_ref().and_then(|k| k.as_str()) {
-					if t.collapsed {
-						app.expanded.remove(id);
-					} else {
-						app.expanded.insert(id.to_owned());
-						// Opening a database loads its objects.
-						if let Some(db) = id.strip_prefix("db:") {
-							app.ensure_catalog(db);
-						}
-					}
-				}
-			},
+			Input::Msg(Msg::Activate(id), _) => app.open_row(&id),
+			Input::Msg(Msg::Fold(id), _) => app.fold(&id),
 			Input::Msg(Msg::Cell(r, c), ev) => {
 				app.click_cell(r, c, shift_held(&ev));
 				session.focus(sf, None)?;
@@ -1224,7 +1351,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				if let Ok(i) = id.parse::<usize>() {
 					app.accept(Some(i));
 				}
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::Tab(id), _) => {
 				if let Ok(i) = id.parse::<usize>() {
@@ -1235,33 +1362,41 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				}
 				// The tab strip takes focus when clicked; typing must go back to the editor.
 				app.in_editor = true;
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::ResultTab(id), _) => {
 				app.out.tab = if id == "msg" { app.out.sets.len() } else { id.trim_start_matches('r').parse().unwrap_or(0) };
 				app.out.sel = None;
 				app.grid_focus = false;
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::NewTab, _) => {
 				app.new_buffer(String::new());
 				app.in_editor = true;
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::CloseTab, _) => {
 				app.close_buffer();
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
-			Input::Msg(Msg::Db(act), _) => {
+			Input::Msg(Msg::Widen, _) => app.side = (app.side + 1) % SIDES.len(),
+			Input::Msg(Msg::DbRow(id, act), _) => {
+				app.picked = Some(id);
 				app.db_action(act);
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
-			Input::Msg(Msg::Script(kind), _) => {
+			Input::Msg(Msg::ScriptRow(id, kind), _) => {
+				app.picked = Some(id);
 				app.script_selected(kind);
-				session.focus(sf, Some(EDITOR))?;
+				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
-			Input::Event(Event::Resize(_)) => app.rows = pane_rows().unwrap_or(app.rows),
+			Input::Event(Event::Resize(r)) => {
+				app.rows = pane_rows().unwrap_or(app.rows);
+				if let Some(c) = r.cell {
+					app.cell = (c.w, c.h);
+				}
+			},
 			_ => continue,
 		}
 		draw(&mut session, sf, &mut app)?;
@@ -1272,9 +1407,16 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 
 /// Renders the view.
 fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> anyhow::Result<()> {
-	// Inline styles are ignored, so the popup's position rides in a stylesheet that is resent when the caret moves.
+	// Tern rejects inline styles and ch/lh units, so positions and heights ride in a stylesheet in pixels, resent when they change.
 	let (line, col) = app.buffers[app.active].line_col();
-	let css = format!(".pop{{top:{:.2}em;left:{:.2}em}}", line as f64 * 1.15, col.saturating_sub(1) as f64 * 0.6);
+	let (cw, ch) = app.cell;
+	let css = format!(
+		".pop{{top:{}px;left:{}px}}.tree{{max-height:{}px}}.gridwrap{{max-height:{}px}}",
+		line as f64 * ch + 6.0,
+		col.saturating_sub(1) as f64 * cw + 12.0,
+		(app.rows - 4.0) * ch,
+		((app.rows * 0.32).round() - 4.0).max(3.0) * ch
+	);
 	if css != app.pop_css {
 		session.stylesheet(sf, "pop", Some(&css))?;
 		app.pop_css = css;
@@ -1303,4 +1445,21 @@ fn pane_rows() -> Option<f64> {
 		}
 	}
 	found.filter(|r| *r >= 12.0)
+}
+
+/// A tree label's spans as `(text, style)`.
+fn label_parts(label: &impl serde::Serialize) -> Vec<(String, String)> {
+	use serde_json::Value;
+	let part = |v: &Value| match v {
+		Value::String(t) => (t.clone(), String::new()),
+		other => (
+			other.get("t").and_then(Value::as_str).unwrap_or_default().to_owned(),
+			other.get("s").and_then(Value::as_str).unwrap_or_default().to_owned(),
+		),
+	};
+	match serde_json::to_value(label) {
+		Ok(Value::Array(a)) => a.iter().map(part).collect(),
+		Ok(v) => vec![part(&v)],
+		Err(_) => Vec::new(),
+	}
 }
