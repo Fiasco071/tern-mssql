@@ -13,6 +13,7 @@ mod guard;
 mod profile;
 mod script;
 mod tsql;
+mod view;
 mod worker;
 
 use std::path::PathBuf;

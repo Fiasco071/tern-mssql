@@ -64,6 +64,8 @@ enum Msg {
 	Col(usize),
 	/// A row number was clicked.
 	Row(usize),
+	/// A header's sort arrow was clicked.
+	Sort(usize),
 	/// The corner of the grid was clicked.
 	GridAll,
 	/// An explorer row was selected.
@@ -365,6 +367,14 @@ struct Output {
 	tab:      usize,
 	/// The selected cells of the active result set.
 	sel:      Option<Sel>,
+	/// The active set's rows as they arrived, kept while it is sorted or filtered.
+	base:     Option<Vec<crate::view::Row>>,
+	/// Sorted column and direction (true is ascending).
+	sort:     Option<(usize, bool)>,
+	/// Rows must contain this text.
+	filter:   String,
+	/// Keys are going into the filter.
+	typing:   bool,
 }
 
 /// A job waiting on or running in the worker.
@@ -419,6 +429,8 @@ struct App {
 	rows: f64,
 	/// Native `edit` events seen; while zero, plain keys edit the buffer.
 	native:    usize,
+	/// Tern's editor is believed to hold keyboard focus (false after any click elsewhere).
+	ed_focused: bool,
 	/// Keys go to the results grid (selection, copy) instead of the editor.
 	grid_focus: bool,
 }
@@ -480,6 +492,7 @@ impl App {
 			side: 4,
 			cell: (10.0, 20.0),
 			native: 0,
+			ed_focused: true,
 			grid_focus: false,
 		};
 		app.ensure_catalog(&current);
@@ -652,7 +665,7 @@ impl App {
 			Reply::Ran(RunResult { sets, messages, ms, error }) => {
 				self.note = format!("{ms} ms");
 				let tab = if error.is_some() || sets.is_empty() { sets.len() } else { 0 };
-				self.out = Output { sets, messages, error: error.is_some(), tab, sel: None };
+				self.out = Output { sets, messages, error: error.is_some(), tab, ..Output::default() };
 				self.grid_focus = false;
 			},
 			Reply::Exported(Ok((path, n))) => {
@@ -972,6 +985,62 @@ impl App {
 		vec![tables, views, prog]
 	}
 
+	/// Puts the active set's rows back as they arrived and drops the sort and filter.
+	fn reset_view(&mut self) {
+		let tab = self.out.tab;
+		if let (Some(base), Some(set)) = (self.out.base.take(), self.out.sets.get_mut(tab)) {
+			set.rows = base;
+		}
+		self.out.sort = None;
+		self.out.filter.clear();
+		self.out.typing = false;
+		self.out.sel = None;
+	}
+
+	/// Rebuilds the active set's rows from the arrived rows, the filter and the sort.
+	fn reshape(&mut self) {
+		let tab = self.out.tab;
+		let Some(set) = self.out.sets.get_mut(tab) else { return };
+		let base = self.out.base.get_or_insert_with(|| set.rows.clone());
+		set.rows = crate::view::shape(base, &self.out.filter, self.out.sort);
+		self.out.sel = None;
+		let (shown, all) = (set.rows.len(), base.len());
+		let sorted = self.out.sort.map(|(c, asc)| format!("  sorted by {} {}", set.columns.get(c).map_or("", String::as_str), if asc { "asc" } else { "desc" })).unwrap_or_default();
+		self.note = if self.out.filter.is_empty() && !self.out.typing {
+			format!("{shown} rows{sorted}")
+		} else {
+			format!("filter: {}{}  ({shown} of {all} rows){sorted}", self.out.filter, if self.out.typing { "|" } else { "" })
+		};
+	}
+
+	/// Sorts by a column: ascending, then descending, then as it arrived.
+	fn sort_col(&mut self, c: usize) {
+		self.grid_focus = true;
+		self.out.sort = match self.out.sort {
+			Some((o, true)) if o == c => Some((c, false)),
+			Some((o, false)) if o == c => None,
+			_ => Some((c, true)),
+		};
+		self.reshape();
+	}
+
+	/// Writes the shown rows to a JSON or INSERT file next to the CSV exports.
+	fn save_view(&mut self, json: bool) {
+		let Some(set) = self.out.sets.get(self.out.tab) else { return };
+		let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+		let db: String = self.current.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+		let (ext, text) = if json {
+			("json", crate::view::json(&set.columns, &set.rows))
+		} else {
+			("sql", crate::view::inserts("[dbo].[Table]", &set.columns, &set.rows))
+		};
+		let path = PathBuf::from(format!("tern-mssql-{db}-{stamp}.{ext}"));
+		self.note = match std::fs::write(&path, text) {
+			Ok(()) => format!("wrote {} rows to {}", set.rows.len(), path.display()),
+			Err(e) => format!("write failed: {e}"),
+		};
+	}
+
 	/// The size of the shown result set: (rows, columns).
 	fn grid_dims(&self) -> Option<(usize, usize)> {
 		self.out.sets.get(self.out.tab).map(|s| (s.rows.len(), s.columns.len()))
@@ -1016,8 +1085,37 @@ impl App {
 
 	/// Keys while the grid has focus: arrows move (shift extends), ctrl+a selects all, ctrl+c copies, esc returns to the editor.
 	fn grid_key(&mut self, key: &tern_sdk::keys::Key) -> bool {
+		if self.out.typing {
+			match key.name.as_str() {
+				"escape" => {
+					self.out.typing = false;
+					self.out.filter.clear();
+				},
+				"enter" => self.out.typing = false,
+				"backspace" => {
+					self.out.filter.pop();
+				},
+				"paste" => self.out.filter.push_str(&key.text.as_deref().unwrap_or_default().replace(['\r', '\n'], " ")),
+				_ => match key.typed().filter(|_| !key.ctrl && !key.meta) {
+					Some(t) => self.out.filter.push_str(t),
+					None => return true,
+				},
+			}
+			self.reshape();
+			return true;
+		}
 		if key.is("escape") {
-			self.grid_focus = false;
+			if !self.out.filter.is_empty() || self.out.sort.is_some() {
+				self.reset_view();
+				self.note = "view reset".into();
+			} else {
+				self.grid_focus = false;
+			}
+			return true;
+		}
+		if key.is("ctrl+f") || (key.typed() == Some("/") && !key.ctrl) {
+			self.out.typing = true;
+			self.reshape();
 			return true;
 		}
 		let Some((rows, cols)) = self.grid_dims().filter(|d| d.0 > 0 && d.1 > 0) else { return false };
@@ -1028,6 +1126,24 @@ impl App {
 		if key.ctrl && key.name == "c" {
 			self.copy(key.shift);
 			return true;
+		}
+		if !key.ctrl && !key.meta {
+			match key.typed() {
+				Some("s") => {
+					let c = self.out.sel.map_or(0, |s| s.c1);
+					self.sort_col(c);
+					return true;
+				},
+				Some("j") => {
+					self.save_view(true);
+					return true;
+				},
+				Some("i") => {
+					self.save_view(false);
+					return true;
+				},
+				_ => {},
+			}
 		}
 		let mut s = self.out.sel.unwrap_or(Sel { r0: 0, c0: 0, r1: 0, c1: 0 });
 		match key.name.as_str() {
@@ -1110,7 +1226,17 @@ impl App {
 			let mut head = html::tr().child(html::th("#").class("rn").on_click(Msg::GridAll));
 			for (c, name) in r.columns.iter().enumerate() {
 				let on = o.sel.is_some_and(|s| s.cols().contains(&c));
-				head = head.child(html::th(name.clone()).class(class(on, "ch")).on_click(Msg::Col(c)));
+				let arrow = match o.sort {
+					Some((sc, true)) if sc == c => "\u{25b2}",
+					Some((sc, false)) if sc == c => "\u{25bc}",
+					_ => "\u{21c5}",
+				};
+				head = head.child(
+					html::th(name.clone())
+						.class(class(on, "ch"))
+						.on_click(Msg::Col(c))
+						.child(html::span(arrow).class(if o.sort.is_some_and(|s| s.0 == c) { "sa on" } else { "sa" }).on_click(Msg::Sort(c))),
+				);
 			}
 			let rows = r.rows.iter().enumerate().take(RENDER_ROWS).map(|(n, row)| {
 				let row_on = o.sel.is_some_and(|s| s.rows().contains(&n));
@@ -1253,7 +1379,8 @@ const GRID_CSS: &str = "\
 .vsep{width:24px;align-self:stretch;display:flex;flex-direction:column;align-items:center;gap:10px;padding-top:8px}.vb{width:22px;height:30px;line-height:28px;text-align:center;border-radius:6px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);color:var(--sf-c-accent);cursor:pointer;font-size:22px}.vb:hover{color:var(--sf-c-accent);background:color-mix(in srgb,var(--sf-c-accent) 18%,transparent)}\
 .grid th{position:sticky;top:0;text-align:left;font-weight:600;padding:2px 14px 2px 8px;white-space:nowrap;cursor:pointer;color:var(--sf-c-muted)}\
 .grid td{padding:1px 14px 1px 8px;white-space:nowrap;cursor:cell}\
-.grid .rn{width:1px;text-align:right;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
+.grid .sa{margin-left:8px;opacity:.45;cursor:pointer}.grid .sa.on{opacity:1;color:var(--sf-c-accent)}\
+.grid .rn{min-width:44px;width:44px;box-sizing:border-box;padding:1px 8px;text-align:right;overflow:visible;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
 .grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 40%,#15171d)}\
 .grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
 .grid td.null{font-style:italic;color:var(--sf-c-muted)}\
@@ -1279,7 +1406,8 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server").role("sqlq"))?;
 	session.stylesheet(sf, "grid", Some(GRID_CSS))?;
 	draw(&mut session, sf, &mut app)?;
-	session.focus(sf, Some(app.editor_id().as_str()))?;
+	app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 	// TERN_MSSQL_TRACE=file logs every input, for diagnosing what Tern sends.
 	let mut just_closed = false;
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
@@ -1309,6 +1437,9 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 			}
 			continue;
 		};
+		if matches!(&input, Input::Msg(m, _) if !matches!(m, Msg::Edit(_) | Msg::Undo)) {
+			app.ed_focused = false;
+		}
 		match input {
 			Input::Key(key) => {
 				let popup = app.popup.is_some();
@@ -1316,7 +1447,8 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 					break;
 				} else if app.grid_focus && app.grid_key(&key) {
 					if !app.grid_focus {
-						session.focus(sf, Some(app.editor_id().as_str()))?;
+						app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 					}
 				} else if popup && key.is("escape") {
 					app.popup = None;
@@ -1350,14 +1482,21 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				} else if key.is("f6") {
 					app.in_editor = !app.in_editor;
 					let id = app.editor_id();
+					app.ed_focused = app.in_editor;
 					session.focus(sf, app.in_editor.then_some(id.as_str()))?;
 				} else if !app.in_editor && !app.grid_focus {
 					app.tree_key(&key);
-				} else if app.native == 0 && !app.grid_focus && app.buf().key(&key) {
+				} else if (app.native == 0 || !app.ed_focused) && !app.grid_focus && app.buf().key(&key) {
+					if !app.ed_focused {
+						// Focus had left the editor; a key arriving here means it must come back.
+						app.ed_focused = true;
+						session.focus(sf, Some(app.editor_id().as_str()))?;
+					}
 					app.complete(false);
 				}
 			},
 			Input::Msg(Msg::Edit(e), _) => {
+				app.ed_focused = true;
 				app.native += 1;
 				if app.buf().apply(&e) {
 					app.complete(false);
@@ -1366,7 +1505,8 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 					app.epoch += 1;
 					app.popup = None;
 					app.note = "editor resynced".into();
-					session.focus(sf, Some(app.editor_id().as_str()))?;
+					app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 				}
 			},
 			Input::Msg(Msg::Undo, _) => {
@@ -1377,31 +1517,42 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				app.rows = pane_rows().unwrap_or(app.rows);
 				app.in_editor = true;
 				app.grid_focus = false;
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::Activate(id), _) => app.open_row(&id),
 			Input::Msg(Msg::Fold(id), _) => app.fold(&id),
 			Input::Msg(Msg::Cell(r, c), ev) => {
 				app.click_cell(r, c, shift_held(&ev));
-				session.focus(sf, None)?;
+				app.ed_focused = false;
+session.focus(sf, None)?;
 			},
 			Input::Msg(Msg::Col(c), ev) => {
 				app.click_col(c, shift_held(&ev));
-				session.focus(sf, None)?;
+				app.ed_focused = false;
+session.focus(sf, None)?;
 			},
 			Input::Msg(Msg::Row(r), ev) => {
 				app.click_row(r, shift_held(&ev));
-				session.focus(sf, None)?;
+				app.ed_focused = false;
+session.focus(sf, None)?;
+			},
+			Input::Msg(Msg::Sort(c), _) => {
+				app.sort_col(c);
+				app.ed_focused = false;
+session.focus(sf, None)?;
 			},
 			Input::Msg(Msg::GridAll, _) => {
 				app.select_all();
-				session.focus(sf, None)?;
+				app.ed_focused = false;
+session.focus(sf, None)?;
 			},
 			Input::Msg(Msg::Pick(id), _) => {
 				if let Ok(i) = id.parse::<usize>() {
 					app.accept(Some(i));
 				}
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::Tab(_), _) if std::mem::take(&mut just_closed) => {},
 			Input::Msg(Msg::Tab(id), _) => {
@@ -1413,35 +1564,42 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				}
 				// The tab strip takes focus when clicked; typing must go back to the editor.
 				app.in_editor = true;
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::ResultTab(id), _) => {
+				app.reset_view();
 				app.out.tab = if id == "msg" { app.out.sets.len() } else { id.trim_start_matches('r').parse().unwrap_or(0) };
 				app.out.sel = None;
 				app.grid_focus = false;
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::NewTab, _) => {
 				app.new_buffer(String::new());
 				app.in_editor = true;
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::CloseTab(i), _) => {
 				app.close_buffer_at(i);
 				just_closed = true;
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
 			Input::Msg(Msg::Side(d), _) => app.side = (app.side as i32 + d).clamp(0, SIDES.len() as i32 - 1) as usize,
 			Input::Msg(Msg::DbRow(id, act), _) => {
 				app.picked = Some(id);
 				app.db_action(act);
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::ScriptRow(id, kind), _) => {
 				app.picked = Some(id);
 				app.script_selected(kind);
-				session.focus(sf, Some(app.editor_id().as_str()))?;
+				app.ed_focused = true;
+session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Event(Event::Resize(r)) => {
 				app.rows = pane_rows().unwrap_or(app.rows);
