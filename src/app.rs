@@ -25,6 +25,9 @@ use crate::{
 const LIMIT: usize = 1000;
 /// Completion rows shown at once.
 const POPUP_ROWS: usize = 8;
+/// CSS pixels per unit of the cell size Tern reports (measured: a text line is about 15.5px, a character about 8.1px).
+const CSS_PER_CELL_H: f64 = 0.78;
+const CSS_PER_CELL_W: f64 = 0.806;
 /// Rows drawn per result set.
 const RENDER_ROWS: usize = 200;
 /// Explorer widths the divider cycles through, as fractions of the window.
@@ -67,8 +70,8 @@ enum Msg {
 	TreeSel(String),
 	/// The new-tab menu item or the + tab was picked.
 	NewTab,
-	/// The close-tab menu item was picked.
-	CloseTab,
+	/// A query tab's × or its menu item was picked.
+	CloseTab(usize),
 	/// The divider was clicked: the next explorer width.
 	Widen,
 }
@@ -496,6 +499,21 @@ impl App {
 		self.start(Job::Catalog(db.to_owned()), "loading objects");
 	}
 
+	/// Lines the work area can use: the pane less the status bar.
+	fn avail_lines(&self) -> f64 {
+		self.rows - 4.0
+	}
+
+	/// Lines the editor takes: a fixed share, so the results get the rest.
+	fn editor_lines(&self) -> f64 {
+		((self.avail_lines() - 5.5) * 0.45).round().max(4.0)
+	}
+
+	/// Lines left for the results grid after both tab strips, the editor and the gap.
+	fn body_lines(&self) -> f64 {
+		(self.avail_lines() - 5.0 - self.editor_lines()).max(3.0)
+	}
+
 	/// The editor's node id.
 	fn editor_id(&self) -> String {
 		format!("main.body.work.ed{}", self.epoch)
@@ -532,8 +550,19 @@ impl App {
 
 	/// Closes the active buffer, keeping at least one.
 	fn close_buffer(&mut self) {
+		self.close_buffer_at(self.active);
+	}
+
+	/// Closes buffer `i`, keeping at least one and the same buffer active where possible.
+	fn close_buffer_at(&mut self, i: usize) {
+		if i >= self.buffers.len() {
+			return;
+		}
 		if self.buffers.len() > 1 {
-			self.buffers.remove(self.active);
+			self.buffers.remove(i);
+			if i < self.active {
+				self.active -= 1;
+			}
 			self.active = self.active.min(self.buffers.len() - 1);
 		} else {
 			self.buffers[0] = Buffer::new("SQLQuery_1.sql".into(), String::new());
@@ -830,8 +859,8 @@ impl App {
 			.basis(SIDES[self.side])
 			.grow(0.0)
 			.shrink(1.0)
-			.min(ui::Bound::h(ui::Extent::Lines(0.0)))
-			.max(ui::Bound::h(ui::Extent::Lines(self.rows - 3.0)))
+			.min(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
+			.max(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
 			.child(html::div().class("tree").children(rows))
 	}
 
@@ -1055,6 +1084,10 @@ impl App {
 	/// The results area: a tab per result set, then Messages.
 	fn results(&self) -> ui::Col<Msg> {
 		let o = &self.out;
+		if o.sets.is_empty() && o.messages.is_empty() {
+			let hint = html::div().class("ln").child(html::span("Run a query with F5, or the statement at the caret with ctrl+enter. Results and messages appear here."));
+			return ui::col().key("res").child(ui::col().key("body").min(ui::Bound::h(ui::Extent::Lines(self.body_lines()))).max(ui::Bound::h(ui::Extent::Lines(self.body_lines()))).child(html::div().class("box").child(hint)));
+		}
 		let mut tabs = ui::tabs().key("rtabs").min(ui::Bound::h(ui::Extent::Lines(2.6))).on_select(|id| Msg::ResultTab(id.to_owned()));
 		for i in 0..o.sets.len() {
 			tabs = tabs.tab(format!("r{i}"), format!("Results {}", i + 1));
@@ -1070,7 +1103,7 @@ impl App {
 				let bad = o.error && i + 1 == o.messages.len();
 				lines.push(html::div().class(if bad { "ln bad" } else { "ln" }).child(html::span(m.clone())));
 			}
-			ui::col().key("body").child(html::div().class("box").children(lines))
+			ui::col().key("body").min(ui::Bound::h(ui::Extent::Lines(self.body_lines()))).max(ui::Bound::h(ui::Extent::Lines(self.body_lines()))).child(html::div().class("box").children(lines))
 		} else {
 			let r = &o.sets[o.tab];
 			let class = |on: bool, base: &str| if on { format!("{base} sel") } else { base.to_owned() };
@@ -1099,32 +1132,35 @@ impl App {
 				tr
 			});
 			let table = html::table().class("grid").child(html::thead().child(head)).child(html::tbody().children(rows));
-			ui::col().key("body").child(html::div().class("gridwrap").child(table))
+			ui::col().key("body").min(ui::Bound::h(ui::Extent::Lines(self.body_lines()))).max(ui::Bound::h(ui::Extent::Lines(self.body_lines()))).child(html::div().class("gridwrap").child(table))
 		};
-		ui::col().key("res").max(ui::Bound::h(ui::Extent::Lines((self.rows * 0.32).round()))).child(tabs).child(body)
+		ui::col().key("res").child(tabs).child(body)
 	}
 
 	/// The query tabs and the active buffer's editor.
 	fn work(&self) -> ui::Col<Msg> {
 		let b = &self.buffers[self.active];
-		let mut tabs = ui::tabs()
-			.key("tabs")
-			.min(ui::Bound::h(ui::Extent::Lines(2.6)))
-			.on_select(|id| if id == "new" { Msg::NewTab } else { Msg::Tab(id.to_owned()) })
-			.on_menu("New query tab", Msg::NewTab)
-			.on_menu("Close tab", Msg::CloseTab);
+		// Our own strip, so every tab can carry a close button and its own menu.
+		let mut tabs = html::div().class("qt");
 		for (i, buf) in self.buffers.iter().enumerate() {
-			let label = if buf.dirty { vec![span(buf.name.clone(), ""), span(" ●", "accent")] } else { vec![span(buf.name.clone(), "")] };
-			tabs = tabs.tab(i.to_string(), label);
+			let mut tab = html::div()
+				.class(if i == self.active { "qtab cur" } else { "qtab" })
+				.on_click(Msg::Tab(i.to_string()))
+				.on_menu("Close tab", Msg::CloseTab(i))
+				.on_menu("New query tab", Msg::NewTab)
+				.child(html::span(buf.name.clone()));
+			if buf.dirty {
+				tab = tab.child(html::span("●").class("s-accent"));
+			}
+			tabs = tabs.child(tab.child(html::span("×").class("qx").on_click(Msg::CloseTab(i))));
 		}
-		tabs = tabs.tab("new", vec![span("+", "accent")]);
-		tabs = tabs.active(self.active.to_string());
+		tabs = tabs.child(html::div().class("qtab plus").on_click(Msg::NewTab).child(html::span("+")));
 		let editor = ui::editor()
 			.key(format!("ed{}", self.epoch))
 			.grow(1.0)
-			.min(ui::Bound::h(ui::Extent::Lines(4.0)))
-			.shrink(1.0)
-			.max(ui::Bound::h(ui::Extent::Lines((self.rows * 0.42).round())))
+			.grow(0.0)
+			.min(ui::Bound::h(ui::Extent::Lines(self.editor_lines())))
+			.max(ui::Bound::h(ui::Extent::Lines(self.editor_lines())))
 			.text(b.text.clone())
 			.cursor(b.cursor)
 			.lang("sql")
@@ -1200,7 +1236,13 @@ const GRID_CSS: &str = "\
 .grid th{background:color-mix(in srgb,var(--sf-c-accent) 12%,#15171d)}\
 .grid tbody tr:nth-child(even) td:not(.sel){background:color-mix(in srgb,var(--sf-c-muted) 7%,transparent)}\
 .hsep{height:0;margin:3px 0}\
-.tree{overflow:auto;padding:4px;font-family:Geist,system-ui,sans-serif;font-size:14.4px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}\
+.qt{display:flex;align-items:center;gap:6px;height:36px;box-sizing:border-box;padding:3px 2px;font-family:Geist,system-ui,sans-serif;font-size:12.9px}\
+.qtab{display:flex;align-items:center;gap:8px;height:28px;box-sizing:border-box;padding:0 8px 0 12px;border-radius:14px;cursor:pointer;color:var(--sf-c-muted);white-space:nowrap}\
+.qtab.cur{color:inherit;background:color-mix(in srgb,var(--sf-c-accent) 16%,#15171d)}\
+.qtab.plus{padding:0 10px;color:var(--sf-c-accent)}\
+.qx{padding:0 4px;border-radius:8px;opacity:.55}\
+.qx:hover{opacity:1;background:color-mix(in srgb,var(--sf-bad) 30%,transparent)}\
+.tree{height:100%;overflow:auto;box-sizing:border-box;padding:4px;font-family:Geist,system-ui,sans-serif;font-size:12.9px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}\
 .tr{display:flex;align-items:center;gap:6px;height:24px;box-sizing:border-box;padding:0 8px;white-space:nowrap;cursor:pointer;border-radius:4px}\
 .tr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
 .tr.cur{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent)}\
@@ -1215,7 +1257,7 @@ const GRID_CSS: &str = "\
 .grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 40%,#15171d)}\
 .grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
 .grid td.null{font-style:italic;color:var(--sf-c-muted)}\
-.gridwrap{overflow:auto;width:100%;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}.box{border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:6px 10px;overflow:auto;width:100%}.ln{white-space:pre-wrap;color:var(--sf-c-muted)}.ln.bad{color:var(--sf-bad)}\
+.gridwrap{height:100%;overflow:auto;box-sizing:border-box;width:100%;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}.box{height:100%;box-sizing:border-box;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:6px 10px;overflow:auto;width:100%}.ln{white-space:pre-wrap;color:var(--sf-c-muted)}.ln.bad{color:var(--sf-bad)}\
 .popwrap{position:relative;height:0;z-index:30}\
 .pop{position:absolute;min-width:260px;max-width:600px;padding:2px 0;border:1px solid var(--sf-c-muted);border-radius:4px;background:color-mix(in srgb,var(--sf-c-accent) 8%,#15171d);box-shadow:0 4px 14px rgba(0,0,0,.5)}\
 .pi{display:flex;gap:12px;padding:0 8px;white-space:nowrap;cursor:pointer}\
@@ -1239,10 +1281,12 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	draw(&mut session, sf, &mut app)?;
 	session.focus(sf, Some(app.editor_id().as_str()))?;
 	// TERN_MSSQL_TRACE=file logs every input, for diagnosing what Tern sends.
+	let mut just_closed = false;
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
 		// Poll while jobs run so the clock ticks and replies show up; block when idle.
-		let wait = (!app.queue.is_empty()).then_some(Duration::from_millis(100));
+		let idle = app.queue.is_empty();
+		let wait = Some(Duration::from_millis(if idle { 1500 } else { 100 }));
 		let input = match session.next(wait) {
 			Ok(input) => input,
 			Err(tern_sdk::Error::InputClosed) => break,
@@ -1254,6 +1298,12 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		}
 		let changed = app.poll();
 		let Some(input) = input else {
+			// Nothing arrived: the pane's height may have changed, and the surface is never told.
+			if idle && let Some(r) = pane_rows().filter(|r| *r != app.rows) {
+				app.rows = r;
+				draw(&mut session, sf, &mut app)?;
+				continue;
+			}
 			if changed {
 				draw(&mut session, sf, &mut app)?;
 			}
@@ -1353,6 +1403,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				}
 				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
+			Input::Msg(Msg::Tab(_), _) if std::mem::take(&mut just_closed) => {},
 			Input::Msg(Msg::Tab(id), _) => {
 				if let Ok(i) = id.parse::<usize>() {
 					if i < app.buffers.len() {
@@ -1375,8 +1426,9 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				app.in_editor = true;
 				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
-			Input::Msg(Msg::CloseTab, _) => {
-				app.close_buffer();
+			Input::Msg(Msg::CloseTab(i), _) => {
+				app.close_buffer_at(i);
+				just_closed = true;
 				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
@@ -1411,11 +1463,9 @@ fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> any
 	let (line, col) = app.buffers[app.active].line_col();
 	let (cw, ch) = app.cell;
 	let css = format!(
-		".pop{{top:{}px;left:{}px}}.tree{{max-height:{}px}}.gridwrap{{max-height:{}px}}",
-		line as f64 * ch + 6.0,
-		col.saturating_sub(1) as f64 * cw + 12.0,
-		(app.rows - 4.0) * ch,
-		((app.rows * 0.32).round() - 4.0).max(3.0) * ch
+		".pop{{top:{}px;left:{}px}}",
+		line as f64 * ch * CSS_PER_CELL_H + 6.0,
+		col.saturating_sub(1) as f64 * cw * CSS_PER_CELL_W + 12.0
 	);
 	if css != app.pop_css {
 		session.stylesheet(sf, "pop", Some(&css))?;
