@@ -474,7 +474,7 @@ impl App {
 			pop_css: String::new(),
 			rows: pane_rows().unwrap_or(40.0),
 			epoch: 0,
-			side: 1,
+			side: 2,
 			cell: (10.0, 20.0),
 			native: 0,
 			grid_focus: false,
@@ -1062,15 +1062,15 @@ impl App {
 		tabs = tabs.tab("msg", if o.error { vec![span("Messages", "error")] } else { vec![span("Messages", "")] });
 		tabs = tabs.active(if o.tab >= o.sets.len() { "msg".to_owned() } else { format!("r{}", o.tab) });
 		let body: ui::Col<Msg> = if o.tab >= o.sets.len() {
-			let mut col = ui::col().key("body");
+			let mut lines = Vec::new();
 			if o.messages.is_empty() {
-				col = col.child(ui::md("F5 runs the script, ctrl+enter the statement at the caret. Results and messages show here.").key("hint"));
+				lines.push(html::div().class("ln").child(html::span("F5 runs the script, ctrl+enter the statement at the caret. Results and messages show here.")));
 			}
 			for (i, m) in o.messages.iter().enumerate() {
 				let bad = o.error && i + 1 == o.messages.len();
-				col = col.child(ui::text(vec![span(m.clone(), if bad { "error" } else { "dim" })]).key(i));
+				lines.push(html::div().class(if bad { "ln bad" } else { "ln" }).child(html::span(m.clone())));
 			}
-			col
+			ui::col().key("body").child(html::div().class("box").children(lines))
 		} else {
 			let r = &o.sets[o.tab];
 			let class = |on: bool, base: &str| if on { format!("{base} sel") } else { base.to_owned() };
@@ -1195,13 +1195,13 @@ impl App {
 
 /// The results grid: cells that select and copy like a spreadsheet's.
 const GRID_CSS: &str = "\
-.grid{border-collapse:collapse;font-variant-numeric:tabular-nums}\
+.grid{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}\
 .grid th,.grid td{border:1px solid color-mix(in srgb,var(--sf-c-muted) 40%,transparent)}\
 .grid th{background:color-mix(in srgb,var(--sf-c-accent) 12%,#15171d)}\
 .grid tbody tr:nth-child(even) td:not(.sel){background:color-mix(in srgb,var(--sf-c-muted) 7%,transparent)}\
 .hsep{height:0;margin:3px 0}\
-.tree{overflow:auto;padding:2px 0}\
-.tr{display:flex;align-items:center;gap:6px;padding:3px 6px;white-space:nowrap;cursor:pointer;border-radius:4px}\
+.tree{overflow:auto;padding:4px;font-family:Geist,system-ui,sans-serif;font-size:14.4px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}\
+.tr{display:flex;align-items:center;gap:6px;height:24px;box-sizing:border-box;padding:0 8px;white-space:nowrap;cursor:pointer;border-radius:4px}\
 .tr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
 .tr.cur{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent)}\
 .tc{width:12px;color:var(--sf-c-muted);text-align:center}\
@@ -1211,11 +1211,11 @@ const GRID_CSS: &str = "\
 .vsep{width:8px;align-self:stretch;cursor:col-resize}\
 .grid th{position:sticky;top:0;text-align:left;font-weight:600;padding:2px 14px 2px 8px;white-space:nowrap;cursor:pointer;color:var(--sf-c-muted)}\
 .grid td{padding:1px 14px 1px 8px;white-space:nowrap;cursor:cell}\
-.grid .rn{text-align:right;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
-.grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 26%,transparent)}\
+.grid .rn{width:1px;text-align:right;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
+.grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 40%,#15171d)}\
 .grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
 .grid td.null{font-style:italic;color:var(--sf-c-muted)}\
-.gridwrap{overflow:auto}\
+.gridwrap{overflow:auto;width:100%;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}.box{border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:6px 10px;overflow:auto;width:100%}.ln{white-space:pre-wrap;color:var(--sf-c-muted)}.ln.bad{color:var(--sf-bad)}\
 .popwrap{position:relative;height:0;z-index:30}\
 .pop{position:absolute;min-width:260px;max-width:600px;padding:2px 0;border:1px solid var(--sf-c-muted);border-radius:4px;background:color-mix(in srgb,var(--sf-c-accent) 8%,#15171d);box-shadow:0 4px 14px rgba(0,0,0,.5)}\
 .pi{display:flex;gap:12px;padding:0 8px;white-space:nowrap;cursor:pointer}\
