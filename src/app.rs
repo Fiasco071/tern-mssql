@@ -91,6 +91,18 @@ pub enum Role {
 	Editor,
 }
 
+/// A question shown over the editor that takes the keys until it is answered.
+enum Prompt {
+	/// Asking where to save buffer `index`; `close` closes it afterwards.
+	SaveAs { input: String, index: usize, close: bool },
+	/// The chosen file exists.
+	Overwrite { path: PathBuf, index: usize, close: bool },
+	/// Closing buffer `index`, which has unsaved changes.
+	Close(usize),
+	/// Quitting with unsaved changes.
+	Quit,
+}
+
 /// What an editor pane opens with.
 #[derive(Default)]
 pub struct Start {
@@ -178,6 +190,11 @@ impl Buffer {
 	}
 
 	/// The caret as a byte offset.
+	/// Changed since it was saved, or never saved and not empty.
+	fn unsaved(&self) -> bool {
+		self.dirty || (self.path.is_none() && !self.text.trim().is_empty())
+	}
+
 	fn cursor_byte(&self) -> usize {
 		byte_of(&self.text, self.cursor)
 	}
@@ -455,6 +472,9 @@ struct App {
 	/// Keys go to the results grid (selection, copy) instead of the editor.
 	grid_focus: bool,
 	role: Role,
+	prompt: Option<Prompt>,
+	/// Set when a prompt confirmed quitting.
+	quit: bool,
 	/// The explorer groups objects in a folder per schema.
 	by_schema: bool,
 	/// An editor's listener and the requests it receives.
@@ -521,6 +541,8 @@ impl App {
 			ed_focused: true,
 			grid_focus: false,
 			role: Role::Whole,
+			prompt: None,
+			quit: false,
 			by_schema: true,
 			remote: None,
 		};
@@ -546,14 +568,19 @@ impl App {
 		self.rows - 4.0
 	}
 
+	/// Lines the prompt bar takes from the editor.
+	fn prompt_lines(&self) -> f64 {
+		if self.prompt.is_some() { 2.0 } else { 0.0 }
+	}
+
 	/// Lines the editor takes: a fixed share, so the results get the rest.
 	fn editor_lines(&self) -> f64 {
-		((self.avail_lines() - 5.5) * 0.45).round().max(4.0)
+		((self.avail_lines() - 5.5) * 0.45).round().max(4.0) - self.prompt_lines()
 	}
 
 	/// Lines left for the results grid after both tab strips, the editor and the gap.
 	fn body_lines(&self) -> f64 {
-		(self.avail_lines() - 5.0 - self.editor_lines()).max(3.0)
+		(self.avail_lines() - 5.0 - self.editor_lines() - self.prompt_lines()).max(3.0)
 	}
 
 	/// The editor's node id.
@@ -590,11 +617,6 @@ impl App {
 		self.popup = None;
 	}
 
-	/// Closes the active buffer, keeping at least one.
-	fn close_buffer(&mut self) {
-		self.close_buffer_at(self.active);
-	}
-
 	/// Closes buffer `i`, keeping at least one and the same buffer active where possible.
 	fn close_buffer_at(&mut self, i: usize) {
 		if i >= self.buffers.len() {
@@ -612,19 +634,175 @@ impl App {
 		self.popup = None;
 	}
 
-	/// Writes the active buffer to its file (in the pane's directory when it has none).
+	/// Ctrl+S: saves in place when the buffer has a file, else asks where.
 	fn save(&mut self) {
-		let b = self.buf();
-		let path = b.path.clone().unwrap_or_else(|| PathBuf::from(&b.name));
-		match std::fs::write(&path, &b.text) {
-			Ok(()) => {
-				b.dirty = false;
-				let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-				b.path = Some(path);
-				self.note = format!("saved {}", full.display());
+		let i = self.active;
+		match self.buffers[i].path.clone() {
+			Some(p) => {
+				self.write_buffer(i, p, false);
 			},
-			Err(e) => self.note = format!("save failed: {e}"),
+			None => self.ask_where(i, false),
 		}
+	}
+
+	/// Asks for a path for buffer `i`, starting from its file or the pane's directory.
+	fn ask_where(&mut self, i: usize, close: bool) {
+		let b = &self.buffers[i];
+		let start = b.path.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(&b.name));
+		self.prompt = Some(Prompt::SaveAs { input: start.display().to_string(), index: i, close });
+	}
+
+	/// Writes buffer `i` to `path`; true when it worked.
+	fn write_buffer(&mut self, i: usize, path: PathBuf, close: bool) -> bool {
+		match std::fs::write(&path, &self.buffers[i].text) {
+			Ok(()) => {
+				let b = &mut self.buffers[i];
+				b.dirty = false;
+				if let Some(n) = path.file_name() {
+					b.name = n.to_string_lossy().into_owned();
+				}
+				self.note = format!("saved {}", path.display());
+				b.path = Some(path);
+				if close {
+					self.close_buffer_at(i);
+				}
+				true
+			},
+			Err(e) => {
+				self.note = format!("save failed: {e}");
+				false
+			},
+		}
+	}
+
+	/// Closes buffer `i`, asking first when it has unsaved changes.
+	fn request_close(&mut self, i: usize) {
+		if i >= self.buffers.len() {
+			return;
+		}
+		if self.buffers[i].unsaved() {
+			self.active = i;
+			self.prompt = Some(Prompt::Close(i));
+		} else {
+			self.close_buffer_at(i);
+		}
+	}
+
+	fn any_unsaved(&self) -> bool {
+		self.buffers.iter().any(Buffer::unsaved)
+	}
+
+	/// A key while a prompt is up.
+	fn prompt_key(&mut self, key: &tern_sdk::keys::Key) {
+		let Some(prompt) = self.prompt.take() else { return };
+		let yes = key.typed().is_some_and(|t| t.eq_ignore_ascii_case("y"));
+		let no = key.typed().is_some_and(|t| t.eq_ignore_ascii_case("n")) || key.is("escape");
+		self.prompt = match prompt {
+			Prompt::SaveAs { mut input, index, close } => {
+				if key.is("escape") {
+					None
+				} else if key.is("enter") {
+					let raw = input.trim().trim_matches('"').to_owned();
+					if raw.is_empty() {
+						Some(Prompt::SaveAs { input, index, close })
+					} else {
+						let mut p = PathBuf::from(&raw);
+						if !p.is_absolute() {
+							p = std::env::current_dir().unwrap_or_default().join(p);
+						}
+						if p.extension().is_none() {
+							p.set_extension("sql");
+						}
+						let same = self.buffers.get(index).and_then(|b| b.path.as_ref()) == Some(&p);
+						if p.exists() && !same {
+							Some(Prompt::Overwrite { path: p, index, close })
+						} else if self.write_buffer(index, p, close) {
+							None
+						} else {
+							Some(Prompt::SaveAs { input, index, close })
+						}
+					}
+				} else {
+					let sep = |c: char| matches!(c, '\\' | '/' | ' ');
+					if key.ctrl && key.name == "backspace" {
+						while input.chars().last().is_some_and(sep) {
+							input.pop();
+						}
+						while input.chars().last().is_some_and(|c| !sep(c)) {
+							input.pop();
+						}
+					} else if key.ctrl && key.name == "u" {
+						input.clear();
+					} else if key.name == "backspace" {
+						input.pop();
+					} else if key.name == "paste" {
+						input.push_str(&key.text.as_deref().unwrap_or_default().replace(['\r', '\n'], ""));
+					} else if let Some(t) = key.typed() {
+						input.push_str(t);
+					}
+					Some(Prompt::SaveAs { input, index, close })
+				}
+			},
+			Prompt::Overwrite { path, index, close } => {
+				if yes {
+					if self.write_buffer(index, path.clone(), close) { None } else { Some(Prompt::SaveAs { input: path.display().to_string(), index, close }) }
+				} else if no {
+					Some(Prompt::SaveAs { input: path.display().to_string(), index, close })
+				} else {
+					Some(Prompt::Overwrite { path, index, close })
+				}
+			},
+			Prompt::Close(i) => {
+				if yes {
+					match self.buffers.get(i).and_then(|b| b.path.clone()) {
+						Some(p) => {
+							if self.write_buffer(i, p, true) { None } else { Some(Prompt::Close(i)) }
+						},
+						None => {
+							self.ask_where(i, true);
+							self.prompt.take()
+						},
+					}
+				} else if key.typed().is_some_and(|t| t.eq_ignore_ascii_case("n")) {
+					self.close_buffer_at(i);
+					None
+				} else if key.is("escape") {
+					None
+				} else {
+					Some(Prompt::Close(i))
+				}
+			},
+			Prompt::Quit => {
+				if yes {
+					self.quit = true;
+					None
+				} else if no {
+					None
+				} else {
+					Some(Prompt::Quit)
+				}
+			},
+		};
+	}
+
+	/// The prompt as a bar over the editor.
+	fn prompt_bar(&self) -> Option<html::El<Msg>> {
+		let name = |i: usize| self.buffers.get(i).map_or_else(String::new, |b| b.name.clone());
+		let (label, value, hint) = match self.prompt.as_ref()? {
+			Prompt::SaveAs { input, .. } => ("Save as".to_owned(), format!("{input}\u{258f}"), "enter saves, esc cancels"),
+			Prompt::Overwrite { path, .. } => (
+				format!("{} exists. Overwrite?", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())),
+				String::new(),
+				"y overwrites, n goes back",
+			),
+			Prompt::Close(i) => (format!("Save changes to {}?", name(*i)), String::new(), "y saves, n discards, esc cancels"),
+			Prompt::Quit => (
+				format!("{} buffer(s) have unsaved changes. Quit anyway?", self.buffers.iter().filter(|b| b.unsaved()).count()),
+				String::new(),
+				"y quits, n or esc stays",
+			),
+		};
+		Some(html::div().class("prompt").child(html::span(label).class("pl")).child(html::span(value).class("pv")).child(html::span(hint).class("ph")))
 	}
 
 	/// Refuses batches that look like writes in read-only mode.
@@ -1374,7 +1552,7 @@ impl App {
 				.on_menu("Close tab", Msg::CloseTab(i))
 				.on_menu("New query tab", Msg::NewTab)
 				.child(html::span(buf.name.clone()));
-			if buf.dirty {
+			if buf.unsaved() {
 				tab = tab.child(html::span("●").class("s-accent"));
 			}
 			tabs = tabs.child(tab.child(html::span("×").class("qx").on_click(Msg::CloseTab(i))));
@@ -1395,6 +1573,9 @@ impl App {
 			.on_undo(Msg::Undo)
 			.on_focus(Msg::Focus);
 		let mut col = ui::col().key("work").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).child(tabs);
+		if let Some(bar) = self.prompt_bar() {
+			col = col.child(bar);
+		}
 		// The popup's anchor has no height and sits at the editor's top edge; the popup is placed from there.
 		if let Some(pop) = self.popup_overlay() {
 			col = col.child(pop);
@@ -1493,6 +1674,7 @@ const GRID_CSS: &str = "\
 .grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
 .grid td.null{font-style:italic;color:var(--sf-c-muted)}\
 .gridwrap{height:100%;overflow:auto;box-sizing:border-box;width:100%;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px}.box{height:100%;box-sizing:border-box;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:6px 10px;overflow:auto;width:100%}.ln{white-space:pre-wrap;color:var(--sf-c-muted)}.ln.bad{color:var(--sf-bad)}\
+.prompt{display:flex;align-items:center;gap:12px;height:30px;box-sizing:border-box;padding:0 10px;margin:2px 0;border:1px solid var(--sf-c-accent);border-radius:6px;font-family:Geist,system-ui,sans-serif;font-size:12.9px;background:color-mix(in srgb,var(--sf-c-accent) 10%,#15171d)}.prompt .pl{color:var(--sf-c-accent);font-weight:600;white-space:nowrap}.prompt .pv{flex:1;white-space:nowrap;overflow:hidden}.prompt .ph{color:var(--sf-c-muted);white-space:nowrap}\
 .popwrap{position:relative;height:0;z-index:30}\
 .pop{position:absolute;min-width:260px;max-width:600px;padding:2px 0;border:1px solid var(--sf-c-muted);border-radius:4px;background:color-mix(in srgb,var(--sf-c-accent) 8%,#15171d);box-shadow:0 4px 14px rgba(0,0,0,.5)}\
 .pi{display:flex;gap:12px;padding:0 8px;white-space:nowrap;cursor:pointer}\
@@ -1549,6 +1731,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	}
 	// TERN_MSSQL_TRACE=file logs every input, for diagnosing what Tern sends.
 	let mut just_closed = false;
+	let mut prompt_was = false;
 	let mut rows_checked = Instant::now();
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
@@ -1595,8 +1778,14 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		match input {
 			Input::Key(key) => {
 				let popup = app.popup.is_some();
-				if key.is("ctrl+q") {
-					break;
+				if app.prompt.is_some() {
+					app.prompt_key(&key);
+				} else if key.is("ctrl+q") {
+					if app.any_unsaved() {
+						app.prompt = Some(Prompt::Quit);
+					} else {
+						break;
+					}
 				} else if app.grid_focus && app.grid_key(&key) {
 					if !app.grid_focus {
 						app.ed_focused = true;
@@ -1628,7 +1817,11 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 				} else if key.is("ctrl+n") {
 					app.new_buffer(String::new());
 				} else if key.is("ctrl+w") {
-					app.close_buffer();
+					let i = app.active;
+					app.request_close(i);
+				} else if key.ctrl && key.shift && key.name == "s" {
+					let i = app.active;
+					app.ask_where(i, false);
 				} else if key.is("ctrl+s") {
 					app.save();
 				} else if key.is("f6") && app.role == Role::Whole {
@@ -1734,7 +1927,7 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::CloseTab(i), _) => {
-				app.close_buffer_at(i);
+				app.request_close(i);
 				just_closed = true;
 				app.ed_focused = true;
 session.focus(sf, Some(app.editor_id().as_str()))?;
@@ -1762,6 +1955,19 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			_ => continue,
 		}
+		if app.quit {
+			break;
+		}
+		// A prompt takes the keys, so the editor must not hold focus while one is up.
+		if app.prompt.is_some() && app.ed_focused {
+			app.ed_focused = false;
+			session.focus(sf, None)?;
+		} else if app.prompt.is_none() && prompt_was {
+			app.in_editor = true;
+			app.ed_focused = true;
+			session.focus(sf, Some(app.editor_id().as_str()))?;
+		}
+		prompt_was = app.prompt.is_some();
 		draw(&mut session, sf, &mut app)?;
 	}
 	session.close()?;
@@ -1823,5 +2029,22 @@ fn label_parts(label: &impl serde::Serialize) -> Vec<(String, String)> {
 		Ok(Value::Array(a)) => a.iter().map(part).collect(),
 		Ok(v) => vec![part(&v)],
 		Err(_) => Vec::new(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn unsaved_means_edited_or_never_saved_with_text() {
+		let mut b = Buffer::new("q.sql".into(), String::new());
+		assert!(!b.unsaved());
+		b.text = "SELECT 1".into();
+		assert!(b.unsaved());
+		b.path = Some(PathBuf::from("q.sql"));
+		assert!(!b.unsaved());
+		b.dirty = true;
+		assert!(b.unsaved());
 	}
 }
