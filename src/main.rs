@@ -14,6 +14,7 @@ mod guard;
 mod profile;
 mod remote;
 mod script;
+mod session;
 mod tsql;
 mod view;
 mod worker;
@@ -87,7 +88,7 @@ Open a table, a database or a script from the explorer, and it appears here.")))
 	session.close()?;
 	let Some(r) = request else { return Ok(()) };
 	let (db, server) = connect(&r.profile)?;
-	let start = app::Start { db: Some(r.db).filter(|d| !d.is_empty()), sql: Some(r.sql).filter(|s| !s.is_empty()), run: r.run };
+	let start = app::Start { db: Some(r.db).filter(|d| !d.is_empty()), sql: Some(r.sql).filter(|s| !s.is_empty()), run: r.run, quiet: r.quiet };
 	app::run(db, r.profile, server, &[], app::Role::Editor, start)
 }
 
@@ -138,6 +139,7 @@ fn main() -> anyhow::Result<()> {
 				match *f {
 					"--db" => start.db = it.next().map(|v| (*v).to_owned()).filter(|v| !v.is_empty()),
 					"--run" => start.run = true,
+					"--quiet" => start.quiet = true,
 					"--sql-file" => {
 						if let Some(path) = it.next() {
 							start.sql = std::fs::read_to_string(path).ok();

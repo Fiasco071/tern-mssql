@@ -25,6 +25,8 @@ pub struct Request {
 	pub sql: String,
 	/// Run it on arrival.
 	pub run: bool,
+	/// Only set the database; open no buffer.
+	pub quiet: bool,
 }
 
 /// What goes over the wire.
@@ -159,6 +161,9 @@ pub fn open(profile: &str, req: &Request, focus: bool) -> Result<(), String> {
 		if req.run {
 			args.push("--run".to_owned());
 		}
+	}
+	if req.quiet {
+		args.push("--quiet".to_owned());
 	}
 	let refs: Vec<&str> = args.iter().map(String::as_str).collect();
 	let out = tern(&refs).ok_or_else(|| "tern split failed".to_owned())?;

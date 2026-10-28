@@ -99,8 +99,6 @@ enum Prompt {
 	Overwrite { path: PathBuf, index: usize, close: bool },
 	/// Closing buffer `index`, which has unsaved changes.
 	Close(usize),
-	/// Quitting with unsaved changes.
-	Quit,
 }
 
 /// What an editor pane opens with.
@@ -109,6 +107,8 @@ pub struct Start {
 	pub db:  Option<String>,
 	pub sql: Option<String>,
 	pub run: bool,
+	/// Only set the database; open no buffer.
+	pub quiet: bool,
 }
 
 /// What the explorer's database menu items do.
@@ -473,8 +473,8 @@ struct App {
 	grid_focus: bool,
 	role: Role,
 	prompt: Option<Prompt>,
-	/// Set when a prompt confirmed quitting.
-	quit: bool,
+	/// The session as last written, to skip identical writes.
+	saved_json: String,
 	/// The explorer groups objects in a folder per schema.
 	by_schema: bool,
 	/// An editor's listener and the requests it receives.
@@ -542,7 +542,7 @@ impl App {
 			grid_focus: false,
 			role: Role::Whole,
 			prompt: None,
-			quit: false,
+			saved_json: String::new(),
 			by_schema: true,
 			remote: None,
 		};
@@ -634,6 +634,64 @@ impl App {
 		self.popup = None;
 	}
 
+	/// The buffers as a session.
+	fn snapshot(&self) -> crate::session::Saved {
+		crate::session::Saved {
+			cwd:     std::env::current_dir().unwrap_or_default().display().to_string(),
+			profile: self.profile.clone(),
+			active:  self.active,
+			buffers: self
+				.buffers
+				.iter()
+				.map(|b| crate::session::SavedBuffer {
+					name:   b.name.clone(),
+					path:   b.path.as_ref().map(|p| p.display().to_string()),
+					text:   b.text.clone(),
+					cursor: b.cursor,
+					dirty:  b.dirty,
+				})
+				.collect(),
+		}
+	}
+
+	/// Brings back a saved session's buffers.
+	fn restore(&mut self, saved: crate::session::Saved) {
+		self.buffers = saved
+			.buffers
+			.into_iter()
+			.map(|sb| {
+				let mut b = Buffer::new(sb.name, sb.text);
+				b.path = sb.path.map(PathBuf::from);
+				b.cursor = sb.cursor.min(u16_len(&b.text));
+				b.dirty = sb.dirty;
+				b
+			})
+			.collect();
+		if self.buffers.is_empty() {
+			self.buffers.push(Buffer::new("SQLQuery_1.sql".into(), String::new()));
+		}
+		self.active = saved.active.min(self.buffers.len() - 1);
+		self.next_id = self.buffers.iter().filter_map(|b| b.name.strip_prefix("SQLQuery_")?.strip_suffix(".sql")?.parse::<usize>().ok()).max().unwrap_or(0).max(self.buffers.len()) + 1;
+		self.note = format!("restored {} buffer(s) from the last session", self.buffers.len());
+	}
+
+	/// Writes the session when it changed.
+	fn autosave(&mut self) {
+		let snap = self.snapshot();
+		if !snap.worth_keeping() {
+			// Everything was closed: forget the old session too.
+			if !self.saved_json.is_empty() {
+				let _ = std::fs::remove_file(crate::session::path(&self.profile));
+				self.saved_json.clear();
+			}
+			return;
+		}
+		let Ok(json) = serde_json::to_string(&snap) else { return };
+		if json != self.saved_json && crate::session::store(&self.profile, &snap).is_ok() {
+			self.saved_json = json;
+		}
+	}
+
 	/// Ctrl+S: saves in place when the buffer has a file, else asks where.
 	fn save(&mut self) {
 		let i = self.active;
@@ -686,10 +744,6 @@ impl App {
 		} else {
 			self.close_buffer_at(i);
 		}
-	}
-
-	fn any_unsaved(&self) -> bool {
-		self.buffers.iter().any(Buffer::unsaved)
 	}
 
 	/// A key while a prompt is up.
@@ -772,16 +826,6 @@ impl App {
 					Some(Prompt::Close(i))
 				}
 			},
-			Prompt::Quit => {
-				if yes {
-					self.quit = true;
-					None
-				} else if no {
-					None
-				} else {
-					Some(Prompt::Quit)
-				}
-			},
 		};
 	}
 
@@ -796,11 +840,6 @@ impl App {
 				"y overwrites, n goes back",
 			),
 			Prompt::Close(i) => (format!("Save changes to {}?", name(*i)), String::new(), "y saves, n discards, esc cancels"),
-			Prompt::Quit => (
-				format!("{} buffer(s) have unsaved changes. Quit anyway?", self.buffers.iter().filter(|b| b.unsaved()).count()),
-				String::new(),
-				"y quits, n or esc stays",
-			),
 		};
 		Some(html::div().class("prompt").child(html::span(label).class("pl")).child(html::span(value).class("pv")).child(html::span(hint).class("ph")))
 	}
@@ -999,7 +1038,7 @@ impl App {
 			}
 			return;
 		}
-		self.note = match remote::open(&self.profile, &remote::Request { profile: self.profile.clone(), db: db.to_owned(), sql, run }, true) {
+		self.note = match remote::open(&self.profile, &remote::Request { profile: self.profile.clone(), db: db.to_owned(), sql, run, quiet: false }, true) {
 			Ok(()) => format!("opened in the editor ({db})"),
 			Err(e) => e,
 		};
@@ -1012,6 +1051,9 @@ impl App {
 			if r.db != self.current {
 				self.start(Job::Switch(r.db.clone()), "switching");
 			}
+		}
+		if r.quiet && r.sql.is_empty() {
+			return;
 		}
 		let fresh = self.buffers.len() == 1 && self.buffers[0].text.is_empty() && !self.buffers[0].dirty;
 		if fresh && !r.sql.is_empty() {
@@ -1702,6 +1744,10 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	if role == Role::Explorer {
 		app.in_editor = false;
 	}
+	if role != Role::Explorer && files.is_empty() && let Some(saved) = crate::session::load(&app.profile) {
+		app.restore(saved);
+		app.saved_json = serde_json::to_string(&app.snapshot()).unwrap_or_default();
+	}
 	if role == Role::Editor {
 		match remote::listen(&app.profile) {
 			Ok(l) => app.remote = Some(l),
@@ -1709,7 +1755,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		}
 		if start.db.is_some() || start.sql.is_some() {
 			let db = start.db.clone().unwrap_or_default();
-			app.open_remote(remote::Request { profile: app.profile.clone(), db, sql: start.sql.clone().unwrap_or_default(), run: start.run });
+			app.open_remote(remote::Request { profile: app.profile.clone(), db, sql: start.sql.clone().unwrap_or_default(), run: start.run, quiet: start.quiet });
 		}
 	}
 	let sf = session.open(SurfaceOptions::screen().title(title).role("sqlq"))?;
@@ -1720,7 +1766,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		session.focus(sf, None)?;
 		// An explorer alone is half a screen: open an editor beside it.
 		// Focus stays here: the user just opened the explorer.
-		let first = remote::Request { profile: app.profile.clone(), db: app.current.clone(), ..remote::Request::default() };
+		let first = remote::Request { profile: app.profile.clone(), db: app.current.clone(), quiet: true, ..remote::Request::default() };
 		if let Err(e) = remote::open(&app.profile, &first, false) {
 			app.note = e;
 		}
@@ -1732,6 +1778,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	// TERN_MSSQL_TRACE=file logs every input, for diagnosing what Tern sends.
 	let mut just_closed = false;
 	let mut prompt_was = false;
+	let mut autosaved = Instant::now();
 	let mut rows_checked = Instant::now();
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
@@ -1746,6 +1793,10 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		if let (Some(i), Some(log)) = (&input, &mut trace) {
 			let _ = std::io::Write::write_all(log, format!("{i:?}
 ").as_bytes());
+		}
+		if app.role != Role::Explorer && autosaved.elapsed() > Duration::from_secs(1) {
+			app.autosave();
+			autosaved = Instant::now();
 		}
 		let mut changed = app.poll();
 		let requests: Vec<remote::Request> = app.remote.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
@@ -1781,11 +1832,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				if app.prompt.is_some() {
 					app.prompt_key(&key);
 				} else if key.is("ctrl+q") {
-					if app.any_unsaved() {
-						app.prompt = Some(Prompt::Quit);
-					} else {
-						break;
-					}
+					break;
 				} else if app.grid_focus && app.grid_key(&key) {
 					if !app.grid_focus {
 						app.ed_focused = true;
@@ -1955,9 +2002,6 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			_ => continue,
 		}
-		if app.quit {
-			break;
-		}
 		// A prompt takes the keys, so the editor must not hold focus while one is up.
 		if app.prompt.is_some() && app.ed_focused {
 			app.ed_focused = false;
@@ -1969,6 +2013,9 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 		}
 		prompt_was = app.prompt.is_some();
 		draw(&mut session, sf, &mut app)?;
+	}
+	if app.role != Role::Explorer {
+		app.autosave();
 	}
 	session.close()?;
 	Ok(())
