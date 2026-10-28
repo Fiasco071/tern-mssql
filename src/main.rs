@@ -1,5 +1,6 @@
 //! `tern-mssql [PROFILE] [FILE.sql...]`: the interactive client (a picker when PROFILE is omitted).
 //! `tern-mssql query PROFILE SQL`: one batch printed as a table.
+//! `tern-mssql --new`: the picker, opened on a blank new-connection form.
 //! `tern-mssql profiles`: the saved profiles.
 
 mod app;
@@ -82,14 +83,14 @@ fn main() -> anyhow::Result<()> {
 			}
 			Ok(())
 		},
+		[] | ["--new"] => match connect::choose(!args.is_empty())? {
+			Some((db, name, server)) => app::run(db, name, server, &[]),
+			None => Ok(()),
+		},
 		[name, files @ ..] => {
 			let (db, server) = connect(name)?;
 			let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
 			app::run(db, (*name).to_owned(), server, &files)
-		},
-		[] => match connect::choose()? {
-			Some((db, name, server)) => app::run(db, name, server, &[]),
-			None => Ok(()),
 		},
 	}
 }

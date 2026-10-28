@@ -217,13 +217,13 @@ fn save(s: &mut State, f: &Form) -> Result<String, String> {
 }
 
 /// Shows the connections and returns a live connection with its profile name and server, or `None` on quit.
-pub fn choose() -> anyhow::Result<Option<(Mssql, String, String)>> {
+pub fn choose(new: bool) -> anyhow::Result<Option<(Mssql, String, String)>> {
 	let Some(mut session) = Session::<Pick>::connect(Options::new())? else {
 		anyhow::bail!("pick a profile by name outside Tern: tern-mssql PROFILE");
 	};
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server"))?;
 	let profiles = profile::load()?;
-	let mode = if profiles.is_empty() { Mode::Form(Form::new(None)) } else { Mode::List };
+	let mode = if new || profiles.is_empty() { Mode::Form(Form::new(None)) } else { Mode::List };
 	let mut s = State { profiles, at: 0, mode, note: String::new() };
 	session.render(sf, view(&s))?;
 	session.focus(sf, Some("main.profiles"))?;
