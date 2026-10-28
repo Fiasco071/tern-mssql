@@ -30,8 +30,8 @@ const CSS_PER_CELL_H: f64 = 0.78;
 const CSS_PER_CELL_W: f64 = 0.806;
 /// Rows drawn per result set.
 const RENDER_ROWS: usize = 200;
-/// Explorer widths the divider cycles through, as fractions of the window.
-const SIDES: [f64; 4] = [0.16, 0.24, 0.32, 0.42];
+/// Explorer widths the divider cycles through, in CSS pixels.
+const SIDES: [f64; 9] = [130.0, 160.0, 200.0, 240.0, 280.0, 330.0, 380.0, 450.0, 540.0];
 /// Separates the parts of an object id (database names can hold dots).
 const SEP: char = '\u{1f}';
 
@@ -72,8 +72,8 @@ enum Msg {
 	NewTab,
 	/// A query tab's × or its menu item was picked.
 	CloseTab(usize),
-	/// The divider was clicked: the next explorer width.
-	Widen,
+	/// A divider button was clicked: step the explorer width by this many sizes.
+	Side(i32),
 }
 
 /// What the explorer's database menu items do.
@@ -477,7 +477,7 @@ impl App {
 			pop_css: String::new(),
 			rows: pane_rows().unwrap_or(40.0),
 			epoch: 0,
-			side: 2,
+			side: 4,
 			cell: (10.0, 20.0),
 			native: 0,
 			grid_focus: false,
@@ -856,7 +856,7 @@ impl App {
 		});
 		ui::col()
 			.key("side")
-			.basis(SIDES[self.side])
+			.basis(ui::Basis::Content)
 			.grow(0.0)
 			.shrink(1.0)
 			.min(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
@@ -1210,7 +1210,7 @@ impl App {
 	fn view(&self) -> View<Msg> {
 		let b = &self.buffers[self.active];
 		let (line, col) = b.line_col();
-		let body = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(self.explorer()).child(html::div().class("vsep").on_click(Msg::Widen)).child(self.work());
+		let body = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(self.explorer()).child(html::div().class("vsep").child(html::span("‹").class("vb").on_click(Msg::Side(-1))).child(html::span("›").class("vb").on_click(Msg::Side(1)))).child(self.work());
 		let catalog = self.catalog().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
 		let status = ui::status()
 			.key("bar")
@@ -1250,7 +1250,7 @@ const GRID_CSS: &str = "\
 .ti{width:14px;text-align:center;color:var(--sf-c-muted)}\
 .d1{padding-left:20px}.d2{padding-left:34px}.d3{padding-left:48px}.d4{padding-left:62px}.d5{padding-left:76px}\
 .s-strong{font-weight:700}.s-accent{color:var(--sf-c-accent)}.s-dim{color:var(--sf-c-muted)}\
-.vsep{width:8px;align-self:stretch;cursor:col-resize}\
+.vsep{width:24px;align-self:stretch;display:flex;flex-direction:column;align-items:center;gap:10px;padding-top:8px}.vb{width:22px;height:30px;line-height:28px;text-align:center;border-radius:6px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);color:var(--sf-c-accent);cursor:pointer;font-size:22px}.vb:hover{color:var(--sf-c-accent);background:color-mix(in srgb,var(--sf-c-accent) 18%,transparent)}\
 .grid th{position:sticky;top:0;text-align:left;font-weight:600;padding:2px 14px 2px 8px;white-space:nowrap;cursor:pointer;color:var(--sf-c-muted)}\
 .grid td{padding:1px 14px 1px 8px;white-space:nowrap;cursor:cell}\
 .grid .rn{width:1px;text-align:right;color:var(--sf-c-muted);cursor:pointer;user-select:none}\
@@ -1338,7 +1338,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				} else if key.is("escape") || key.is("ctrl+x") {
 					app.cancel();
 				} else if key.alt && (key.name == "left" || key.name == "right") {
-					app.side = if key.name == "right" { (app.side + 1).min(SIDES.len() - 1) } else { app.side.saturating_sub(1) };
+					app.side = (app.side as i32 + if key.name == "right" { 1 } else { -1 }).clamp(0, SIDES.len() as i32 - 1) as usize;
 				} else if key.is("f8") {
 					app.write = !app.write;
 				} else if key.is("ctrl+n") {
@@ -1432,7 +1432,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
-			Input::Msg(Msg::Widen, _) => app.side = (app.side + 1) % SIDES.len(),
+			Input::Msg(Msg::Side(d), _) => app.side = (app.side as i32 + d).clamp(0, SIDES.len() as i32 - 1) as usize,
 			Input::Msg(Msg::DbRow(id, act), _) => {
 				app.picked = Some(id);
 				app.db_action(act);
@@ -1463,9 +1463,10 @@ fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> any
 	let (line, col) = app.buffers[app.active].line_col();
 	let (cw, ch) = app.cell;
 	let css = format!(
-		".pop{{top:{}px;left:{}px}}",
+		".pop{{top:{}px;left:{}px}}.tree{{width:{}px}}",
 		line as f64 * ch * CSS_PER_CELL_H + 6.0,
-		col.saturating_sub(1) as f64 * cw * CSS_PER_CELL_W + 12.0
+		col.saturating_sub(1) as f64 * cw * CSS_PER_CELL_W + 12.0,
+		SIDES[app.side]
 	);
 	if css != app.pop_css {
 		session.stylesheet(sf, "pop", Some(&css))?;
