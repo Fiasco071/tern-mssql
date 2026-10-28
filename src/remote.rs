@@ -49,6 +49,10 @@ struct Entry {
 
 /// Where registry entries and pending SQL files live.
 fn dir() -> PathBuf {
+	// Tests point this at a temporary folder so they never touch (or message) real panes.
+	if let Some(d) = std::env::var_os("TERN_MSSQL_EDITORS_DIR") {
+		return PathBuf::from(d);
+	}
 	crate::profile::path().parent().map(PathBuf::from).unwrap_or_default().join("editors")
 }
 
@@ -186,6 +190,9 @@ mod tests {
 
 	#[test]
 	fn editor_receives_what_the_explorer_sends() {
+		let tmp = std::env::temp_dir().join(format!("tern-mssql-test-{}", std::process::id()));
+		// Nothing else in the test process reads this variable.
+		unsafe { std::env::set_var("TERN_MSSQL_EDITORS_DIR", &tmp) };
 		let (_guard, rx) = listen("unit-test-profile").unwrap();
 		let sent = send("unit-test-profile", &Request { db: "AppDb".into(), sql: "SELECT 1".into(), run: true, ..Request::default() });
 		assert!(sent.is_some());
@@ -193,6 +200,8 @@ mod tests {
 		assert_eq!((got.db.as_str(), got.sql.as_str(), got.run), ("AppDb", "SELECT 1", true));
 		// Another profile's request finds no editor.
 		assert!(send("some-other-profile", &Request::default()).is_none());
+		drop(_guard);
+		let _ = std::fs::remove_dir_all(&tmp);
 	}
 
 	#[test]

@@ -300,31 +300,35 @@ struct State {
 }
 
 const CSS: &str = "\
-.cm{padding:10px 14px;font-family:Geist,system-ui,sans-serif;font-size:12.9px}\
-.ct{font-weight:700;font-size:15px;margin:2px 0 10px}\
-.cl{border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:4px}\
-.cr{display:flex;align-items:center;gap:14px;height:32px;box-sizing:border-box;padding:0 12px;border-radius:5px;border:1px solid transparent;cursor:pointer}\
+.cm{box-sizing:border-box;width:100%;max-width:100%;overflow-x:hidden;padding:8px 10px;font-family:Geist,system-ui,sans-serif;font-size:12.9px}\
+.cm *{min-width:0;box-sizing:border-box}\
+.ct{font-weight:700;font-size:14px;margin:0 0 8px}\
+.cl{border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);border-radius:6px;padding:3px}\
+.cr{display:block;padding:5px 10px;border-radius:5px;border:1px solid transparent;cursor:pointer}\
 .cr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
 .cr.sel{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent);border-color:var(--sf-c-accent)}\
-.cn{font-weight:600;min-width:130px}.cd{color:var(--sf-c-muted)}\
-.bar{display:flex;align-items:center;gap:10px;margin-top:12px}\
-.bt{display:inline-flex;align-items:center;height:28px;box-sizing:border-box;padding:0 16px;border-radius:6px;border:1px solid var(--sf-c-accent);color:var(--sf-c-accent);cursor:pointer;white-space:nowrap}\
+.cn{display:block;font-weight:600}\
+.cd{display:block;color:var(--sf-c-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:10px}\
+.bt{display:inline-flex;align-items:center;height:26px;padding:0 12px;border-radius:6px;border:1px solid var(--sf-c-accent);color:var(--sf-c-accent);cursor:pointer;white-space:nowrap}\
 .bt:hover{background:color-mix(in srgb,var(--sf-c-accent) 20%,transparent)}\
 .bt.pri{background:color-mix(in srgb,var(--sf-c-accent) 32%,transparent);color:inherit;font-weight:600}\
 .bt.bad{border-color:var(--sf-bad);color:var(--sf-bad)}\
-.fr{display:flex;align-items:center;gap:14px;min-height:36px;box-sizing:border-box;padding:2px 10px;margin:2px 0;border-radius:6px;border:1px solid transparent;cursor:pointer}\
+.ask{width:100%;margin-bottom:2px}\
+.fr{display:block;padding:4px 8px 6px;margin:2px 0;border-radius:6px;border:1px solid transparent;cursor:pointer}\
 .fr:hover{background:color-mix(in srgb,var(--sf-c-muted) 10%,transparent)}\
 .fr.on{border-color:var(--sf-c-accent);background:color-mix(in srgb,var(--sf-c-accent) 12%,transparent)}\
-.fl{width:150px;color:var(--sf-c-muted)}.fr.on .fl{color:var(--sf-c-accent);font-weight:600}\
-.fv{flex:1;min-height:22px;box-sizing:border-box;padding:3px 10px;border-radius:5px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);white-space:nowrap;overflow:hidden}\
+.fl{display:block;margin-bottom:3px;color:var(--sf-c-muted);font-size:12px}.fr.on .fl{color:var(--sf-c-accent);font-weight:600}\
+.fv{display:block;width:100%;min-height:24px;padding:3px 8px;border-radius:5px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.fv.wrap{white-space:normal;word-break:break-all}\
 .fr.on .fv{border-color:var(--sf-c-accent);background:color-mix(in srgb,#000 30%,transparent)}\
 .cu{color:var(--sf-c-accent)}\
-.seg{display:inline-flex;border:1px solid var(--sf-c-accent);border-radius:6px;overflow:hidden}\
-.sg{padding:4px 14px;cursor:pointer;color:var(--sf-c-muted)}.sg:hover{color:inherit}\
+.seg{display:flex;width:100%;border:1px solid var(--sf-c-accent);border-radius:6px;overflow:hidden}\
+.sg{flex:1;padding:4px 6px;text-align:center;cursor:pointer;color:var(--sf-c-muted)}.sg:hover{color:inherit}\
 .sg.on{background:color-mix(in srgb,var(--sf-c-accent) 32%,transparent);color:inherit;font-weight:600}\
-.ck{display:inline-flex;align-items:center;gap:8px;cursor:pointer}.ck .bx{width:16px;text-align:center;color:var(--sf-c-accent);font-size:15px}\
-.nt{margin-top:10px;color:var(--sf-c-muted)}.nt.bad{color:var(--sf-bad)}\
-.hp{margin-top:12px;color:var(--sf-c-muted);font-size:12px}";
+.ck{display:flex;align-items:center;gap:8px;cursor:pointer}.ck .bx{color:var(--sf-c-accent);font-size:15px}\
+.nt{margin-top:8px;color:var(--sf-c-muted);word-break:break-word}.nt.bad{color:var(--sf-bad)}\
+.hp{margin-top:10px;color:var(--sf-c-muted);font-size:12px;word-break:break-word}";
 
 fn button(label: &str, class: &str, msg: Pick) -> html::El<Pick> {
 	html::span(label.to_owned()).class(format!("bt {class}")).on_click(msg)
@@ -361,14 +365,14 @@ fn view(s: &State) -> View<Pick> {
 						html::div()
 							.class("seg")
 							.child(html::span("Fields").class(if f.string { "sg" } else { "sg on" }).on_click(Pick::SetString(false)))
-							.child(html::span("Connection string").class(if f.string { "sg on" } else { "sg" }).on_click(Pick::SetString(true))),
+							.child(html::span("String").class(if f.string { "sg on" } else { "sg" }).on_click(Pick::SetString(true))),
 					),
 					Row::Trust => line.child(
 						html::div()
 							.class("ck")
 							.on_click(Pick::ToggleTrust)
 							.child(html::span(if f.values[TRUST] == "yes" { "\u{2611}" } else { "\u{2610}" }).class("bx"))
-							.child(html::span("Trust the server certificate")),
+							.child(html::span("Trust server certificate")),
 					),
 					_ => {
 						let mut shown = match row {
@@ -388,7 +392,7 @@ fn view(s: &State) -> View<Pick> {
 								_ => String::new(),
 							};
 						}
-						let mut value = html::div().class("fv").child(html::span(shown));
+						let mut value = html::div().class(if *row == Row::ConnString { "fv wrap" } else { "fv" }).child(html::span(shown));
 						if on {
 							value = value.child(html::span("\u{258f}").class("cu"));
 						}
@@ -404,7 +408,7 @@ fn view(s: &State) -> View<Pick> {
 					.child(button("Test connection", "", Pick::Test))
 					.child(button("Cancel", "", Pick::Cancel)),
 			);
-			page = page.child(html::div().class("hp").child(html::span("Click a field and type. Tab and the arrows move between fields. Enter saves, Esc cancels.")));
+			page = page.child(html::div().class("hp").child(html::span("Click a field, then type. Enter saves, Esc cancels.")));
 		},
 		_ => {
 			if s.profiles.is_empty() {
@@ -419,8 +423,7 @@ fn view(s: &State) -> View<Pick> {
 							.on_click(Pick::Row(i))
 							.on_dblclick(Pick::Connect(i))
 							.child(html::span(p.name.clone()).class("cn"))
-							.child(html::span(p.server.clone()).class("cd"))
-							.child(html::span(p.user.clone()).class("cd")),
+							.child(html::span(if p.user.is_empty() { p.server.clone() } else { format!("{} @ {}", p.user, p.server) }).class("cd")),
 					);
 				}
 				page = page.child(list);
@@ -428,7 +431,7 @@ fn view(s: &State) -> View<Pick> {
 				let bar = if matches!(s.mode, Mode::Delete) {
 					html::div()
 						.class("bar")
-						.child(html::span(format!("Delete {name}?")))
+						.child(html::div().class("ask").child(html::span(format!("Delete {name}?"))))
 						.child(button("Delete", "bad", Pick::DeleteYes))
 						.child(button("Keep it", "", Pick::DeleteNo))
 				} else {
@@ -441,7 +444,7 @@ fn view(s: &State) -> View<Pick> {
 						.child(button("Quit", "", Pick::Quit))
 				};
 				page = page.child(bar);
-				page = page.child(html::div().class("hp").child(html::span("Click a connection to select it, double-click to connect. Keys: enter, n, e, d, esc.")));
+				page = page.child(html::div().class("hp").child(html::span("Click to select, double-click to connect.")));
 			}
 		},
 	}
