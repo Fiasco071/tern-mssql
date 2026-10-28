@@ -17,12 +17,14 @@ use crate::{
 	backend::{Backend, Cancel, Rows},
 	catalog::{Catalog, ObjKind},
 	complete::{self, Completion, ItemKind},
-	guard, tsql,
+	guard, script, tsql,
 	worker::{Job, Reply, RunResult, Worker},
 };
 
 /// Rows kept per result set.
 const LIMIT: usize = 1000;
+/// Rows drawn per result set.
+const RENDER_ROWS: usize = 200;
 /// The query editor's id.
 const EDITOR: &str = "main.body.work.ed";
 /// The explorer's id.
@@ -57,6 +59,14 @@ enum Msg {
 	Row(usize),
 	/// The corner of the grid was clicked.
 	GridAll,
+	/// An explorer row was selected.
+	TreeSel(String),
+	/// A "Script as" menu item was picked.
+	Script(script::Kind),
+	/// The new-tab menu item or the + tab was picked.
+	NewTab,
+	/// The close-tab menu item was picked.
+	CloseTab,
 }
 
 /// The selected block of result cells: where it started and where the caret is.
@@ -312,6 +322,8 @@ struct App {
 	note:      String,
 	write:     bool,
 	in_editor: bool,
+	/// The explorer row last selected, which the right-click menu acts on.
+	picked: Option<String>,
 	/// Native `edit` events seen; while zero, plain keys edit the buffer.
 	native:    usize,
 	/// Keys go to the results grid (selection, copy) instead of the editor.
@@ -368,6 +380,7 @@ impl App {
 			note: String::new(),
 			write: false,
 			in_editor: true,
+			picked: None,
 			native: 0,
 			grid_focus: false,
 		};
@@ -569,6 +582,24 @@ impl App {
 		}
 	}
 
+	/// Opens a new buffer holding generated T-SQL for the selected table or view.
+	fn script_selected(&mut self, kind: script::Kind) {
+		let Some(full) = self.picked.as_deref().and_then(|id| id.strip_prefix("o:")) else {
+			self.note = "select a table or view first".into();
+			return;
+		};
+		let mut parts = full.splitn(3, SEP);
+		let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
+		let Some(obj) = self.catalogs.get(db).and_then(|c| c.find(Some(schema), name)) else { return };
+		if !matches!(obj.kind, ObjKind::Table | ObjKind::View) {
+			self.note = "script as works on tables and views".into();
+			return;
+		}
+		let q = if db == self.current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) };
+		let sql = script::generate(kind, obj, &q);
+		self.new_buffer(sql);
+	}
+
 	/// Recomputes the completion popup after an edit or on request.
 	fn complete(&mut self, force: bool) {
 		let b = &self.buffers[self.active];
@@ -612,7 +643,18 @@ impl App {
 			};
 			srv = srv.child(item);
 		}
-		ui::tree().key("tree").basis(0.24).grow(0.0).on_activate(|id| Msg::Activate(id.to_owned())).on_toggle(|_| Msg::Toggle).item(srv)
+		let mut tree = ui::tree()
+			.key("tree")
+			.basis(0.24)
+			.grow(0.0)
+			.max(ui::Bound::h(ui::Extent::Fraction(1.0)))
+			.on_select(|id| Msg::TreeSel(id.to_owned()))
+			.on_activate(|id| Msg::Activate(id.to_owned()))
+			.on_toggle(|_| Msg::Toggle);
+		for kind in [script::Kind::Select, script::Kind::Insert, script::Kind::Update, script::Kind::Delete, script::Kind::Create] {
+			tree = tree.on_menu(kind.act(), Msg::Script(kind));
+		}
+		tree.item(srv)
 	}
 
 	/// One database's folders and objects.
@@ -780,7 +822,7 @@ impl App {
 	/// The results area: a tab per result set, then Messages.
 	fn results(&self) -> ui::Col<Msg> {
 		let o = &self.out;
-		let mut tabs = ui::tabs().key("rtabs").min(ui::Bound::h(ui::Extent::Lines(2.0))).on_select(|id| Msg::ResultTab(id.to_owned()));
+		let mut tabs = ui::tabs().key("rtabs").min(ui::Bound::h(ui::Extent::Lines(2.6))).on_select(|id| Msg::ResultTab(id.to_owned()));
 		for i in 0..o.sets.len() {
 			tabs = tabs.tab(format!("r{i}"), format!("Results {}", i + 1));
 		}
@@ -804,7 +846,7 @@ impl App {
 				let on = o.sel.is_some_and(|s| s.cols().contains(&c));
 				head = head.child(html::th(name.clone()).class(class(on, "ch")).on_click(Msg::Col(c)));
 			}
-			let rows = r.rows.iter().enumerate().map(|(n, row)| {
+			let rows = r.rows.iter().enumerate().take(RENDER_ROWS).map(|(n, row)| {
 				let row_on = o.sel.is_some_and(|s| s.rows().contains(&n));
 				let mut tr = html::tr().child(html::td((n + 1).to_string()).class(class(row_on, "rn")).on_click(Msg::Row(n)));
 				for (c, cell) in row.iter().enumerate() {
@@ -832,11 +874,17 @@ impl App {
 	/// The query tabs and the active buffer's editor.
 	fn work(&self) -> ui::Col<Msg> {
 		let b = &self.buffers[self.active];
-		let mut tabs = ui::tabs().key("tabs").min(ui::Bound::h(ui::Extent::Lines(2.0))).on_select(|id| Msg::Tab(id.to_owned()));
+		let mut tabs = ui::tabs()
+			.key("tabs")
+			.min(ui::Bound::h(ui::Extent::Lines(2.6)))
+			.on_select(|id| if id == "new" { Msg::NewTab } else { Msg::Tab(id.to_owned()) })
+			.on_menu("New query tab", Msg::NewTab)
+			.on_menu("Close tab", Msg::CloseTab);
 		for (i, buf) in self.buffers.iter().enumerate() {
 			let label = if buf.dirty { vec![span(buf.name.clone(), ""), span(" ●", "accent")] } else { vec![span(buf.name.clone(), "")] };
 			tabs = tabs.tab(i.to_string(), label);
 		}
+		tabs = tabs.tab("new", vec![span("+", "accent")]);
 		tabs = tabs.active(self.active.to_string());
 		let editor = ui::editor()
 			.key("ed")
@@ -1043,11 +1091,29 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 						app.popup = None;
 					}
 				}
+				// The tab strip takes focus when clicked; typing must go back to the editor.
+				app.in_editor = true;
+				session.focus(sf, Some(EDITOR))?;
 			},
 			Input::Msg(Msg::ResultTab(id), _) => {
 				app.out.tab = if id == "msg" { app.out.sets.len() } else { id.trim_start_matches('r').parse().unwrap_or(0) };
 				app.out.sel = None;
 				app.grid_focus = false;
+				session.focus(sf, Some(EDITOR))?;
+			},
+			Input::Msg(Msg::NewTab, _) => {
+				app.new_buffer(String::new());
+				app.in_editor = true;
+				session.focus(sf, Some(EDITOR))?;
+			},
+			Input::Msg(Msg::CloseTab, _) => {
+				app.close_buffer();
+				session.focus(sf, Some(EDITOR))?;
+			},
+			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
+			Input::Msg(Msg::Script(kind), _) => {
+				app.script_selected(kind);
+				session.focus(sf, Some(EDITOR))?;
 			},
 			_ => continue,
 		}

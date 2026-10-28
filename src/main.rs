@@ -10,6 +10,7 @@ mod complete;
 mod connect;
 mod guard;
 mod profile;
+mod script;
 mod tsql;
 mod worker;
 
