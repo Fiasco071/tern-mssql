@@ -17,7 +17,7 @@ use crate::{
 	backend::{Backend, Cancel, Rows},
 	catalog::{Catalog, ObjKind},
 	complete::{self, Completion, ItemKind},
-	guard, script, tsql,
+	guard, remote, script, tsql,
 	worker::{Job, Reply, RunResult, Worker},
 };
 
@@ -76,6 +76,25 @@ enum Msg {
 	CloseTab(usize),
 	/// A divider button was clicked: step the explorer width by this many sizes.
 	Side(i32),
+}
+
+/// Which part of the client this process is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+	/// Explorer, editor and results in one pane.
+	Whole,
+	/// The object tree and connections; opens SQL in an editor pane.
+	Explorer,
+	/// Buffers and results; takes SQL from the explorer.
+	Editor,
+}
+
+/// What an editor pane opens with.
+#[derive(Default)]
+pub struct Start {
+	pub db:  Option<String>,
+	pub sql: Option<String>,
+	pub run: bool,
 }
 
 /// What the explorer's database menu items do.
@@ -433,6 +452,9 @@ struct App {
 	ed_focused: bool,
 	/// Keys go to the results grid (selection, copy) instead of the editor.
 	grid_focus: bool,
+	role: Role,
+	/// An editor's listener and the requests it receives.
+	remote: Option<(remote::Listening, std::sync::mpsc::Receiver<remote::Request>)>,
 }
 
 /// `[schema].[name]`.
@@ -494,6 +516,8 @@ impl App {
 			native: 0,
 			ed_focused: true,
 			grid_focus: false,
+			role: Role::Whole,
+			remote: None,
 		};
 		app.ensure_catalog(&current);
 		Ok(app)
@@ -701,6 +725,10 @@ impl App {
 
 	/// A tree row was activated.
 	fn activate(&mut self, id: &str) {
+		if self.role == Role::Explorer && id.starts_with("db:") {
+			self.fold(id);
+			return;
+		}
 		if let Some(name) = id.strip_prefix("db:") {
 			self.ensure_catalog(name);
 			if name != self.current {
@@ -711,16 +739,13 @@ impl App {
 			let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
 			let Some(kind) = self.catalogs.get(db).and_then(|c| c.find(Some(schema), name)).map(|o| o.kind) else { return };
 			// An object in another database is reached by its three-part name, so the editor's database stays put.
-			let q = if db == self.current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) };
+			let q = self.qualify(db, schema, name);
 			let sql = match kind {
 				ObjKind::Table | ObjKind::View => format!("SELECT TOP (1000) *\nFROM {q}"),
 				ObjKind::Proc => format!("EXEC {q}"),
 				ObjKind::Func => format!("SELECT * FROM {q}()"),
 			};
-			self.new_buffer(sql.clone());
-			if matches!(kind, ObjKind::Table | ObjKind::View) {
-				self.run(vec![sql]);
-			}
+			self.open_sql(db, sql, matches!(kind, ObjKind::Table | ObjKind::View));
 		}
 	}
 
@@ -732,14 +757,16 @@ impl App {
 		};
 		let mut parts = full.splitn(3, SEP);
 		let (Some(db), Some(schema), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
+		let db = db.to_owned();
+		let db = db.as_str();
 		let Some(obj) = self.catalogs.get(db).and_then(|c| c.find(Some(schema), name)) else { return };
 		if !matches!(obj.kind, ObjKind::Table | ObjKind::View) {
 			self.note = "script as works on tables and views".into();
 			return;
 		}
-		let q = if db == self.current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) };
+		let q = self.qualify(db, schema, name);
 		let sql = script::generate(kind, obj, &q);
-		self.new_buffer(sql);
+		self.open_sql(db, sql, false);
 	}
 
 	/// The database the selected explorer row belongs to.
@@ -763,6 +790,7 @@ impl App {
 		};
 		match act {
 			DbAct::Use => self.activate(&format!("db:{db}")),
+			DbAct::NewQuery if self.role == Role::Explorer => self.open_sql(&db, String::new(), false),
 			DbAct::NewQuery => {
 				self.activate(&format!("db:{db}"));
 				self.new_buffer(String::new());
@@ -771,6 +799,50 @@ impl App {
 				self.catalogs.remove(&db);
 				self.ensure_catalog(&db);
 			},
+		}
+	}
+
+	/// An object's name as the editor should write it: the editor is switched to the object's database, so two parts suffice there.
+	fn qualify(&self, db: &str, schema: &str, name: &str) -> String {
+		if self.role == Role::Explorer || db == self.current { quoted(schema, name) } else { format!("[{}].{}", db.replace(']', "]]"), quoted(schema, name)) }
+	}
+
+	/// Opens `sql` on `db`: in an editor pane from the explorer, in a new buffer otherwise.
+	fn open_sql(&mut self, db: &str, sql: String, run: bool) {
+		if self.role != Role::Explorer {
+			self.new_buffer(sql.clone());
+			if run {
+				self.run(vec![sql]);
+			}
+			return;
+		}
+		self.note = match remote::open(&self.profile, &remote::Request { db: db.to_owned(), sql, run }) {
+			Ok(()) => format!("opened in the editor ({db})"),
+			Err(e) => e,
+		};
+	}
+
+	/// An editor pane: opens what the explorer sent, switching to its database first.
+	fn open_remote(&mut self, r: remote::Request) {
+		if !r.db.is_empty() {
+			self.ensure_catalog(&r.db);
+			if r.db != self.current {
+				self.start(Job::Switch(r.db.clone()), "switching");
+			}
+		}
+		let fresh = self.buffers.len() == 1 && self.buffers[0].text.is_empty() && !self.buffers[0].dirty;
+		if fresh && !r.sql.is_empty() {
+			let b = &mut self.buffers[0];
+			b.text = r.sql.clone();
+			b.cursor = u16_len(&b.text);
+		} else if !fresh {
+			self.new_buffer(r.sql.clone());
+		}
+		self.popup = None;
+		self.in_editor = true;
+		self.grid_focus = false;
+		if r.run && !r.sql.is_empty() {
+			self.run(vec![r.sql]);
 		}
 	}
 
@@ -802,7 +874,7 @@ impl App {
 		srv.icon = Some("server".into());
 		for d in &self.databases {
 			let id = format!("db:{d}");
-			let label = if *d == self.current { vec![span("● ", "accent"), span(d.clone(), "strong")] } else { vec![span(d.clone(), "")] };
+			let label = if *d == self.current && self.role != Role::Explorer { vec![span("● ", "accent"), span(d.clone(), "strong")] } else { vec![span(d.clone(), "")] };
 			let mut item = TreeItem::new(id.clone(), label).open(open(&id));
 			item.icon = Some("database".into());
 			item.children = match self.catalogs.get(d) {
@@ -857,7 +929,12 @@ impl App {
 				row = row.child(html::span(text).class(format!("s-{}", if style.is_empty() { "plain" } else { style.as_str() })));
 			}
 			if id.starts_with("db:") {
-				for (name, act) in [("New query on database", DbAct::NewQuery), ("Use database", DbAct::Use), ("Refresh database", DbAct::Refresh)] {
+				let acts = if self.role == Role::Explorer {
+					vec![("New query on database", DbAct::NewQuery), ("Refresh database", DbAct::Refresh)]
+				} else {
+					vec![("New query on database", DbAct::NewQuery), ("Use database", DbAct::Use), ("Refresh database", DbAct::Refresh)]
+				};
+				for (name, act) in acts {
 					row = row.on_menu(name, Msg::DbRow(id.clone(), act));
 				}
 			} else if id.starts_with("o:") {
@@ -870,7 +947,7 @@ impl App {
 		ui::col()
 			.key("side")
 			.basis(ui::Basis::Content)
-			.grow(0.0)
+			.grow(if self.role == Role::Explorer { 1.0 } else { 0.0 })
 			.shrink(1.0)
 			.min(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
 			.max(ui::Bound::h(ui::Extent::Lines(self.avail_lines())))
@@ -1336,20 +1413,29 @@ impl App {
 	fn view(&self) -> View<Msg> {
 		let b = &self.buffers[self.active];
 		let (line, col) = b.line_col();
-		let body = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(self.explorer()).child(html::div().class("vsep").child(html::span("‹").class("vb").on_click(Msg::Side(-1))).child(html::span("›").class("vb").on_click(Msg::Side(1)))).child(self.work());
+		let side = html::div().class("vsep").child(html::span("‹").class("vb").on_click(Msg::Side(-1))).child(html::span("›").class("vb").on_click(Msg::Side(1)));
+		let row = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch);
+		let body = match self.role {
+			Role::Explorer => row.child(self.explorer()),
+			Role::Editor => row.child(self.work()),
+			Role::Whole => row.child(self.explorer()).child(side).child(self.work()),
+		};
 		let catalog = self.catalog().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
-		let status = ui::status()
-			.key("bar")
-			.child(ui::seg(format!("{} / {}", self.profile, self.current)).icon("database"))
-			.child(ui::seg(format!("Ln {line}, Col {col}")))
-			.child(ui::seg(catalog).tone(Tone::Muted))
-			.child(ui::seg(if self.native > 0 { "native edit" } else { "key edit" }).tone(Tone::Muted))
-			.child(ui::seg(self.note.clone()).tone(Tone::Muted))
-			.child(
+		let mut status = ui::status().key("bar").child(ui::seg(format!("{} / {}", self.profile, if self.role == Role::Explorer { self.server.as_str() } else { self.current.as_str() })).icon("database"));
+		if self.role != Role::Explorer {
+			status = status
+				.child(ui::seg(format!("Ln {line}, Col {col}")))
+				.child(ui::seg(catalog).tone(Tone::Muted))
+				.child(ui::seg(if self.native > 0 { "native edit" } else { "key edit" }).tone(Tone::Muted));
+		}
+		status = status.child(ui::seg(self.note.clone()).tone(Tone::Muted));
+		if self.role != Role::Explorer {
+			status = status.child(
 				ui::seg(if self.write { "WRITE" } else { "read-only" })
 					.side(Side::Right)
 					.tone(if self.write { Tone::Warning } else { Tone::Success }),
 			);
+		}
 		let main = ui::col().min(ui::Bound::h(ui::Extent::Fraction(1.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(body);
 		View::new().main(main).dock(nodes![status])
 	}
@@ -1398,23 +1484,52 @@ fn shift_held(ev: &Event) -> bool {
 }
 
 /// Runs the client until the user quits.
-pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, files: &[PathBuf]) -> anyhow::Result<()> {
+pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, files: &[PathBuf], role: Role, start: Start) -> anyhow::Result<()> {
 	let Some(mut session) = Session::connect(Options::new().feature(feature::SEND).feature(feature::EDIT).feature(feature::UNDO))? else {
 		anyhow::bail!("interactive mode needs a terminal that speaks TSP (Tern); use `tern-mssql query` instead");
 	};
 	let mut app = App::new(db, profile, server, files)?;
-	let sf = session.open(SurfaceOptions::screen().title("SQL Server").role("sqlq"))?;
+	app.role = role;
+	let title = match role {
+		Role::Explorer => "SQL Explorer",
+		Role::Editor => "SQL Editor",
+		Role::Whole => "SQL Server",
+	};
+	if role == Role::Explorer {
+		app.in_editor = false;
+	}
+	if role == Role::Editor {
+		match remote::listen(&app.profile) {
+			Ok(l) => app.remote = Some(l),
+			Err(e) => app.note = format!("no link to the explorer: {e}"),
+		}
+		if start.db.is_some() || start.sql.is_some() {
+			let db = start.db.clone().unwrap_or_default();
+			app.open_remote(remote::Request { db, sql: start.sql.clone().unwrap_or_default(), run: start.run });
+		}
+	}
+	let sf = session.open(SurfaceOptions::screen().title(title).role("sqlq"))?;
 	session.stylesheet(sf, "grid", Some(GRID_CSS))?;
 	draw(&mut session, sf, &mut app)?;
-	app.ed_focused = true;
-session.focus(sf, Some(app.editor_id().as_str()))?;
+	if role == Role::Explorer {
+		app.ed_focused = false;
+		session.focus(sf, None)?;
+		// An explorer alone is half a screen: open an editor beside it.
+		let db = app.current.clone();
+		app.open_sql(&db, String::new(), false);
+		draw(&mut session, sf, &mut app)?;
+	} else {
+		app.ed_focused = true;
+		session.focus(sf, Some(app.editor_id().as_str()))?;
+	}
 	// TERN_MSSQL_TRACE=file logs every input, for diagnosing what Tern sends.
 	let mut just_closed = false;
+	let mut rows_checked = Instant::now();
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
 		// Poll while jobs run so the clock ticks and replies show up; block when idle.
 		let idle = app.queue.is_empty();
-		let wait = Some(Duration::from_millis(if idle { 1500 } else { 100 }));
+		let wait = Some(Duration::from_millis(if !idle { 100 } else if app.remote.is_some() { 250 } else { 1500 }));
 		let input = match session.next(wait) {
 			Ok(input) => input,
 			Err(tern_sdk::Error::InputClosed) => break,
@@ -1424,10 +1539,22 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 			let _ = std::io::Write::write_all(log, format!("{i:?}
 ").as_bytes());
 		}
-		let changed = app.poll();
+		let mut changed = app.poll();
+		let requests: Vec<remote::Request> = app.remote.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
+		if !requests.is_empty() {
+			for r in requests {
+				app.open_remote(r);
+			}
+			app.ed_focused = true;
+			session.focus(sf, Some(app.editor_id().as_str()))?;
+			changed = true;
+		}
 		let Some(input) = input else {
 			// Nothing arrived: the pane's height may have changed, and the surface is never told.
-			if idle && let Some(r) = pane_rows().filter(|r| *r != app.rows) {
+			if idle && rows_checked.elapsed() > Duration::from_millis(1500) && let Some(r) = {
+				rows_checked = Instant::now();
+				pane_rows().filter(|r| *r != app.rows)
+			} {
 				app.rows = r;
 				draw(&mut session, sf, &mut app)?;
 				continue;
@@ -1479,7 +1606,7 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 					app.close_buffer();
 				} else if key.is("ctrl+s") {
 					app.save();
-				} else if key.is("f6") {
+				} else if key.is("f6") && app.role == Role::Whole {
 					app.in_editor = !app.in_editor;
 					let id = app.editor_id();
 					app.ed_focused = app.in_editor;
@@ -1621,10 +1748,10 @@ fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> any
 	let (line, col) = app.buffers[app.active].line_col();
 	let (cw, ch) = app.cell;
 	let css = format!(
-		".pop{{top:{}px;left:{}px}}.tree{{width:{}px}}",
+		".pop{{top:{}px;left:{}px}}.tree{{width:{}}}",
 		line as f64 * ch * CSS_PER_CELL_H + 6.0,
 		col.saturating_sub(1) as f64 * cw * CSS_PER_CELL_W + 12.0,
-		SIDES[app.side]
+		if app.role == Role::Explorer { "100%".to_owned() } else { format!("{}px", SIDES[app.side]) }
 	);
 	if css != app.pop_css {
 		session.stylesheet(sf, "pop", Some(&css))?;

@@ -1,5 +1,6 @@
 //! `tern-mssql [PROFILE] [FILE.sql...]`: the interactive client (a picker when PROFILE is omitted).
 //! `tern-mssql query PROFILE SQL`: one batch printed as a table.
+//! `tern-mssql explorer PROFILE`, `tern-mssql editor PROFILE [--db DB] [--sql-file F] [--run]`: the two panes of the split layout.
 //! `tern-mssql --new`: the picker, opened on a blank new-connection form.
 //! `tern-mssql profiles`: the saved profiles.
 
@@ -11,6 +12,7 @@ mod complete;
 mod connect;
 mod guard;
 mod profile;
+mod remote;
 mod script;
 mod tsql;
 mod view;
@@ -85,13 +87,36 @@ fn main() -> anyhow::Result<()> {
 			Ok(())
 		},
 		[] | ["--new"] => match connect::choose(!args.is_empty())? {
-			Some((db, name, server)) => app::run(db, name, server, &[]),
+			Some((db, name, server)) => app::run(db, name, server, &[], app::Role::Explorer, app::Start::default()),
 			None => Ok(()),
+		},
+		["explorer", name] => {
+			let (db, server) = connect(name)?;
+			app::run(db, (*name).to_owned(), server, &[], app::Role::Explorer, app::Start::default())
+		},
+		["editor", name, flags @ ..] => {
+			let mut start = app::Start::default();
+			let mut it = flags.iter();
+			while let Some(f) = it.next() {
+				match *f {
+					"--db" => start.db = it.next().map(|v| (*v).to_owned()).filter(|v| !v.is_empty()),
+					"--run" => start.run = true,
+					"--sql-file" => {
+						if let Some(path) = it.next() {
+							start.sql = std::fs::read_to_string(path).ok();
+							let _ = std::fs::remove_file(path);
+						}
+					},
+					_ => {},
+				}
+			}
+			let (db, server) = connect(name)?;
+			app::run(db, (*name).to_owned(), server, &[], app::Role::Editor, start)
 		},
 		[name, files @ ..] => {
 			let (db, server) = connect(name)?;
 			let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-			app::run(db, (*name).to_owned(), server, &files)
+			app::run(db, (*name).to_owned(), server, &files, app::Role::Whole, app::Start::default())
 		},
 	}
 }
