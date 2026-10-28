@@ -55,6 +55,42 @@ fn connect(name: &str) -> anyhow::Result<(Mssql, String)> {
 	Ok((db, p.server.clone()))
 }
 
+/// What an idle pane's session can send (nothing).
+#[derive(Clone, Debug)]
+enum Idle {}
+
+/// A pane that shows a hint until the explorer asks for something, then becomes the editor for that connection.
+fn waiting() -> anyhow::Result<()> {
+	use std::time::Duration;
+
+	use tern_sdk::{Input, Options, Session, SurfaceOptions, ui};
+	let Some(mut session) = Session::<Idle>::connect(Options::new())? else {
+		anyhow::bail!("this pane needs Tern");
+	};
+	let sf = session.open(SurfaceOptions::screen().title("SQL Editor"))?;
+	session.render(sf, View::<Idle>::new().main(ui::md("**SQL editor**
+
+Open a table, a database or a script from the explorer, and it appears here.")))?;
+	let (guard, rx) = remote::listen(remote::IDLE)?;
+	let request = loop {
+		if let Ok(r) = rx.recv_timeout(Duration::from_millis(200)) {
+			break Some(r);
+		}
+		match session.next(Some(Duration::from_millis(50))) {
+			Ok(Some(Input::Key(k))) if k.is("ctrl+q") => break None,
+			Ok(_) => {},
+			Err(tern_sdk::Error::InputClosed) => break None,
+			Err(e) => return Err(e.into()),
+		}
+	};
+	drop(guard);
+	session.close()?;
+	let Some(r) = request else { return Ok(()) };
+	let (db, server) = connect(&r.profile)?;
+	let start = app::Start { db: Some(r.db).filter(|d| !d.is_empty()), sql: Some(r.sql).filter(|s| !s.is_empty()), run: r.run };
+	app::run(db, r.profile, server, &[], app::Role::Editor, start)
+}
+
 fn main() -> anyhow::Result<()> {
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	// `--trace FILE` logs every input the client receives, for diagnosing what Tern sends.
@@ -90,6 +126,7 @@ fn main() -> anyhow::Result<()> {
 			Some((db, name, server)) => app::run(db, name, server, &[], app::Role::Explorer, app::Start::default()),
 			None => Ok(()),
 		},
+		["waiting"] => waiting(),
 		["explorer", name] => {
 			let (db, server) = connect(name)?;
 			app::run(db, (*name).to_owned(), server, &[], app::Role::Explorer, app::Start::default())

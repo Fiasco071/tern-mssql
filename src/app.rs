@@ -816,7 +816,7 @@ impl App {
 			}
 			return;
 		}
-		self.note = match remote::open(&self.profile, &remote::Request { db: db.to_owned(), sql, run }) {
+		self.note = match remote::open(&self.profile, &remote::Request { profile: self.profile.clone(), db: db.to_owned(), sql, run }) {
 			Ok(()) => format!("opened in the editor ({db})"),
 			Err(e) => e,
 		};
@@ -1505,7 +1505,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		}
 		if start.db.is_some() || start.sql.is_some() {
 			let db = start.db.clone().unwrap_or_default();
-			app.open_remote(remote::Request { db, sql: start.sql.clone().unwrap_or_default(), run: start.run });
+			app.open_remote(remote::Request { profile: app.profile.clone(), db, sql: start.sql.clone().unwrap_or_default(), run: start.run });
 		}
 	}
 	let sf = session.open(SurfaceOptions::screen().title(title).role("sqlq"))?;

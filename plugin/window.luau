@@ -4,6 +4,10 @@
 
 local GROUP = "SQL Server"
 
+-- The explorer's share of the tab's width (0.1 to 0.9). Edit it and run
+-- `tern plugin reload` to change the default.
+local EXPLORER_SHARE = 0.22
+
 local function launch(cx: WindowCx, command: string, how: "tab" | "split")
 	if how == "split" then
 		local pane = cx.layout:focused()
@@ -21,7 +25,14 @@ tern.command({
 	icon = "database",
 	group = GROUP,
 	run = function(cx)
-		launch(cx, "tern-mssql", "tab")
+		-- The explorer on the left, an idle editor pane on the right that the explorer fills in.
+		cx.layout:tab({
+			name = "SQL Server",
+			split = "right",
+			ratio = EXPLORER_SHARE,
+			{ launch = { command = "tern-mssql" } },
+			{ launch = { command = "tern-mssql waiting" } },
+		})
 	end,
 })
 

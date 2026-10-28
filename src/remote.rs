@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Request {
 	/// The database the SQL is for.
+	/// The connection to open it on (an idle pane has none yet).
+	pub profile: String,
 	pub db:  String,
 	/// The text of the new buffer (may be empty).
 	pub sql: String,
@@ -58,6 +60,9 @@ fn token() -> String {
 	}
 	out
 }
+
+/// The registry name of a pane that is waiting to become an editor for whichever connection asks first.
+pub const IDLE: &str = "*";
 
 /// An editor's side: the registry entry lives as long as this value.
 pub struct Listening {
@@ -100,25 +105,27 @@ pub fn listen(profile: &str) -> anyhow::Result<(Listening, Receiver<Request>)> {
 
 /// Sends `req` to a live editor for `profile`. Returns that editor's pane id on success; dead entries are removed.
 fn send(profile: &str, req: &Request) -> Option<Option<String>> {
-	let entries = std::fs::read_dir(dir()).ok()?;
-	for e in entries.flatten() {
-		let path = e.path();
-		let Some(entry) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Entry>(&t).ok()) else { continue };
-		if entry.profile != profile {
+	// A listening editor for this connection first, then an idle pane (`*`) that can become one.
+	let files: Vec<PathBuf> = std::fs::read_dir(dir()).ok()?.flatten().map(|e| e.path()).collect();
+	for wanted in [profile, IDLE] {
+	for path in &files {
+		let Some(entry) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Entry>(&t).ok()) else { continue };
+		if entry.profile != wanted {
 			continue;
 		}
 		let addr = std::net::SocketAddr::from(([127, 0, 0, 1], entry.port));
 		match TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
 			Ok(mut s) => {
-				let wire = Wire { token: entry.token, req: req.clone() };
+				let wire = Wire { token: entry.token, req: Request { profile: profile.to_owned(), ..req.clone() } };
 				if writeln!(s, "{}", serde_json::to_string(&wire).ok()?).is_ok() {
 					return Some(entry.pane);
 				}
 			},
 			Err(_) => {
-				let _ = std::fs::remove_file(&path);
+				let _ = std::fs::remove_file(path);
 			},
 		}
+	}
 	}
 	None
 }
@@ -167,7 +174,7 @@ mod tests {
 
 	#[test]
 	fn wire_round_trip() {
-		let w = Wire { token: "t".into(), req: Request { db: "master".into(), sql: "SELECT 1".into(), run: true } };
+		let w = Wire { token: "t".into(), req: Request { db: "master".into(), sql: "SELECT 1".into(), run: true, ..Request::default() } };
 		let back: Wire = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
 		assert_eq!((back.token.as_str(), back.req.db.as_str(), back.req.run), ("t", "master", true));
 	}
@@ -175,7 +182,7 @@ mod tests {
 	#[test]
 	fn editor_receives_what_the_explorer_sends() {
 		let (_guard, rx) = listen("unit-test-profile").unwrap();
-		let sent = send("unit-test-profile", &Request { db: "AppDb".into(), sql: "SELECT 1".into(), run: true });
+		let sent = send("unit-test-profile", &Request { db: "AppDb".into(), sql: "SELECT 1".into(), run: true, ..Request::default() });
 		assert!(sent.is_some());
 		let got = rx.recv_timeout(Duration::from_secs(3)).unwrap();
 		assert_eq!((got.db.as_str(), got.sql.as_str(), got.run), ("AppDb", "SELECT 1", true));
