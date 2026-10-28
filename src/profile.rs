@@ -32,6 +32,10 @@ pub struct Profile {
 	/// Accept the server's certificate without validating it.
 	#[serde(default)]
 	pub trust_cert:   bool,
+	/// An ADO.NET connection string used as written, minus the password (which is stored apart). `server`,
+	/// `port` and `user` then only describe it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub connection_string: Option<String>,
 }
 
 const fn port() -> u16 {
@@ -99,11 +103,29 @@ impl Profile {
 
 	/// The ADO connection string.
 	pub fn ado(&self) -> anyhow::Result<String> {
+		if self.connection_string.is_some() {
+			// A string may need no password at all (integrated security), so a missing stored one is fine,
+			// but a named env var that is unset is a mistake worth reporting.
+			let pw = if self.password_env.is_some() { Some(self.password()?) } else { self.password().ok() };
+			return Ok(self.with_string(pw.as_deref()));
+		}
 		self.ado_with(&self.password()?)
+	}
+
+	/// The saved connection string with `pw` added as its password.
+	fn with_string(&self, pw: Option<&str>) -> String {
+		let mut s = self.connection_string.clone().unwrap_or_default().trim_end_matches(';').to_owned();
+		if let Some(pw) = pw {
+			s.push_str(&format!(";Password={{{}}}", pw.replace('}', "}}")));
+		}
+		s
 	}
 
 	/// The ADO connection string with an explicit password.
 	pub fn ado_with(&self, pw: &str) -> anyhow::Result<String> {
+		if self.connection_string.is_some() {
+			return Ok(self.with_string(Some(pw)));
+		}
 		if self.server.trim().is_empty() {
 			bail!("server is empty");
 		}
@@ -119,5 +141,24 @@ impl Profile {
 			s.push_str(";TrustServerCertificate=true");
 		}
 		Ok(s)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_connection_string_profile_gets_its_password_at_connect_time() {
+		let p = Profile { name: "x".into(), connection_string: Some("Server=tcp:h,1433;User Id=sa;Encrypt=true;".into()), ..Profile::default() };
+		assert_eq!(p.ado_with("p}q").unwrap(), "Server=tcp:h,1433;User Id=sa;Encrypt=true;Password={p}}q}");
+		let json = serde_json::to_string(&p).unwrap();
+		assert!(!json.contains("Password"));
+	}
+
+	#[test]
+	fn field_profiles_still_build_their_string() {
+		let p = Profile { name: "x".into(), server: "h".into(), port: 1433, user: "sa".into(), ..Profile::default() };
+		assert!(p.ado_with("pw").unwrap().starts_with("server=tcp:h,1433;user id=sa;password={pw}"));
 	}
 }
