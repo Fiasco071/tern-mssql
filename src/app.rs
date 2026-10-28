@@ -99,6 +99,8 @@ enum Prompt {
 	Overwrite { path: PathBuf, index: usize, close: bool },
 	/// Closing buffer `index`, which has unsaved changes.
 	Close(usize),
+	/// The system's Save dialog is open for buffer `index`.
+	Dialog { index: usize, close: bool },
 }
 
 /// What an editor pane opens with.
@@ -473,6 +475,8 @@ struct App {
 	grid_focus: bool,
 	role: Role,
 	prompt: Option<Prompt>,
+	/// The answer of the system Save dialog, while one is open.
+	dialog: Option<std::sync::mpsc::Receiver<crate::dialog::Outcome>>,
 	/// The session as last written, to skip identical writes.
 	saved_json: String,
 	/// The explorer groups objects in a folder per schema.
@@ -542,6 +546,7 @@ impl App {
 			grid_focus: false,
 			role: Role::Whole,
 			prompt: None,
+			dialog: None,
 			saved_json: String::new(),
 			by_schema: true,
 			remote: None,
@@ -705,6 +710,21 @@ impl App {
 
 	/// Asks for a path for buffer `i`, starting from its file or the pane's directory.
 	fn ask_where(&mut self, i: usize, close: bool) {
+		if std::env::var_os("TERN_MSSQL_SAVE_PROMPT").is_none() && crate::dialog::available() {
+			let cwd = std::env::current_dir().unwrap_or_default();
+			let b = &self.buffers[i];
+			let (dir, name) = match &b.path {
+				Some(p) => (p.parent().map_or_else(|| cwd.clone(), PathBuf::from), p.file_name().map_or_else(|| b.name.clone(), |n| n.to_string_lossy().into_owned())),
+				None => (cwd, b.name.clone()),
+			};
+			let (tx, rx) = std::sync::mpsc::channel();
+			std::thread::spawn(move || {
+				let _ = tx.send(crate::dialog::save_as(&dir, &name));
+			});
+			self.dialog = Some(rx);
+			self.prompt = Some(Prompt::Dialog { index: i, close });
+			return;
+		}
 		let b = &self.buffers[i];
 		let start = b.path.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(&b.name));
 		self.prompt = Some(Prompt::SaveAs { input: start.display().to_string(), index: i, close });
@@ -731,6 +751,28 @@ impl App {
 				false
 			},
 		}
+	}
+
+	/// Takes the system Save dialog's answer when it has one. True when something changed.
+	fn poll_dialog(&mut self) -> bool {
+		let Some(rx) = &self.dialog else { return false };
+		let Ok(outcome) = rx.try_recv() else { return false };
+		self.dialog = None;
+		// Esc may have dismissed the bar already; then the answer is stale.
+		let Some(Prompt::Dialog { index, close }) = self.prompt.take_if(|p| matches!(p, Prompt::Dialog { .. })) else { return true };
+		match outcome {
+			crate::dialog::Outcome::Chosen(path) => {
+				if !self.write_buffer(index, path.clone(), close) {
+					self.prompt = Some(Prompt::SaveAs { input: path.display().to_string(), index, close });
+				}
+			},
+			crate::dialog::Outcome::Cancelled => self.note = "save cancelled".into(),
+			crate::dialog::Outcome::Unavailable => {
+				let start = self.buffers.get(index).map(|b| std::env::current_dir().unwrap_or_default().join(&b.name)).unwrap_or_default();
+				self.prompt = Some(Prompt::SaveAs { input: start.display().to_string(), index, close });
+			},
+		}
+		true
 	}
 
 	/// Closes buffer `i`, asking first when it has unsaved changes.
@@ -806,6 +848,14 @@ impl App {
 					Some(Prompt::Overwrite { path, index, close })
 				}
 			},
+			Prompt::Dialog { index, close } => {
+				if key.is("escape") {
+					self.dialog = None;
+					None
+				} else {
+					Some(Prompt::Dialog { index, close })
+				}
+			},
 			Prompt::Close(i) => {
 				if yes {
 					match self.buffers.get(i).and_then(|b| b.path.clone()) {
@@ -839,6 +889,7 @@ impl App {
 				String::new(),
 				"y overwrites, n goes back",
 			),
+			Prompt::Dialog { .. } => ("Save as".to_owned(), "choose a file in the Save dialog".to_owned(), "esc cancels"),
 			Prompt::Close(i) => (format!("Save changes to {}?", name(*i)), String::new(), "y saves, n discards, esc cancels"),
 		};
 		Some(html::div().class("prompt").child(html::span(label).class("pl")).child(html::span(value).class("pv")).child(html::span(hint).class("ph")))
@@ -1783,7 +1834,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	let mut trace = std::env::var_os("TERN_MSSQL_TRACE").and_then(|p| std::fs::File::create(p).ok());
 	loop {
 		// Poll while jobs run so the clock ticks and replies show up; block when idle.
-		let idle = app.queue.is_empty();
+		let idle = app.queue.is_empty() && app.dialog.is_none();
 		let wait = Some(Duration::from_millis(if !idle { 100 } else if app.remote.is_some() { 250 } else { 1500 }));
 		let input = match session.next(wait) {
 			Ok(input) => input,
@@ -1799,6 +1850,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 			autosaved = Instant::now();
 		}
 		let mut changed = app.poll();
+		changed |= app.poll_dialog();
 		let requests: Vec<remote::Request> = app.remote.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
 		if !requests.is_empty() {
 			for r in requests {

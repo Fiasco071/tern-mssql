@@ -10,6 +10,7 @@ mod catalog;
 mod clip;
 mod complete;
 mod connect;
+mod dialog;
 mod guard;
 mod profile;
 mod remote;
