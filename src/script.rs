@@ -35,7 +35,7 @@ pub fn generate(kind: Kind, obj: &Obj, q: &str) -> String {
 	let cols = &obj.columns;
 	let list = |sep: &str, f: &dyn Fn(&crate::catalog::Col) -> String| cols.iter().map(f).collect::<Vec<_>>().join(sep);
 	match kind {
-		Kind::Select => format!("SELECT {}\nFROM {q};", list(",\n       ", &|c| b(&c.name))),
+		Kind::Select => format!("SELECT TOP (1000) {}\nFROM {q};", list(",\n       ", &|c| b(&c.name))),
 		Kind::Insert => {
 			let writable: Vec<_> = cols.iter().filter(|c| !c.identity).collect();
 			format!(

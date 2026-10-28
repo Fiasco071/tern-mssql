@@ -23,6 +23,8 @@ use crate::{
 
 /// Rows kept per result set.
 const LIMIT: usize = 1000;
+/// Completion rows shown at once.
+const POPUP_ROWS: usize = 8;
 /// Rows drawn per result set.
 const RENDER_ROWS: usize = 200;
 /// The query editor's id.
@@ -67,6 +69,19 @@ enum Msg {
 	NewTab,
 	/// The close-tab menu item was picked.
 	CloseTab,
+	/// A database menu item was picked.
+	Db(DbAct),
+}
+
+/// What the explorer's database menu items do.
+#[derive(Clone, Copy, Debug)]
+enum DbAct {
+	/// A new empty buffer on the database.
+	NewQuery,
+	/// Make it the editor's database.
+	Use,
+	/// Reload its objects.
+	Refresh,
 }
 
 /// The selected block of result cells: where it started and where the caret is.
@@ -200,6 +215,17 @@ impl Buffer {
 			"enter" => self.put("\n"),
 			"tab" => self.put("  "),
 			"paste" => self.put(key.text.as_deref().unwrap_or_default()),
+			"backspace" if key.ctrl && c > 0 => {
+				let from = self.word_before(c);
+				self.cursor -= u16_len(&self.text[from..c]);
+				self.text.replace_range(from..c, "");
+			},
+			"delete" if key.ctrl && c < self.text.len() => {
+				let to = self.word_after(c);
+				self.text.replace_range(c..to, "");
+			},
+			"left" if key.ctrl => self.cursor -= u16_len(&self.text[self.word_before(c)..c]),
+			"right" if key.ctrl => self.cursor += u16_len(&self.text[c..self.word_after(c)]),
 			"backspace" if c > 0 => {
 				let (i, ch) = self.text[..c].char_indices().next_back().unwrap_or((0, ' '));
 				self.text.remove(i);
@@ -233,6 +259,60 @@ impl Buffer {
 			},
 		}
 		true
+	}
+
+	/// Where the word before byte `c` starts: skips spaces, then a run of word characters or of punctuation.
+	fn word_before(&self, c: usize) -> usize {
+		let class = |ch: char| if ch.is_alphanumeric() || ch == '_' { 1 } else if ch == '\n' { 2 } else { 0 };
+		let mut i = c;
+		let mut chars = self.text[..c].chars().rev().peekable();
+		while let Some(&ch) = chars.peek() {
+			if ch == ' ' || ch == '\t' {
+				i -= ch.len_utf8();
+				chars.next();
+			} else {
+				break;
+			}
+		}
+		let Some(&first) = chars.peek() else { return i };
+		let kind = class(first);
+		for ch in chars {
+			if class(ch) != kind || kind == 2 && i < c && self.text[i..c].contains('\n') {
+				break;
+			}
+			i -= ch.len_utf8();
+			if kind == 2 {
+				break;
+			}
+		}
+		i
+	}
+
+	/// Where the word after byte `c` ends.
+	fn word_after(&self, c: usize) -> usize {
+		let class = |ch: char| if ch.is_alphanumeric() || ch == '_' { 1 } else if ch == '\n' { 2 } else { 0 };
+		let mut i = c;
+		let mut chars = self.text[c..].chars().peekable();
+		while let Some(&ch) = chars.peek() {
+			if ch == ' ' || ch == '\t' {
+				i += ch.len_utf8();
+				chars.next();
+			} else {
+				break;
+			}
+		}
+		let Some(&first) = chars.peek() else { return i };
+		let kind = class(first);
+		for ch in chars {
+			if class(ch) != kind {
+				break;
+			}
+			i += ch.len_utf8();
+			if kind == 2 {
+				break;
+			}
+		}
+		i
 	}
 
 	/// Inserts text at the caret.
@@ -324,6 +404,10 @@ struct App {
 	in_editor: bool,
 	/// The explorer row last selected, which the right-click menu acts on.
 	picked: Option<String>,
+	/// The popup position last sent as a stylesheet.
+	pop_css: String,
+	/// The pane's height in rows, which the layout bounds are shares of.
+	rows: f64,
 	/// Native `edit` events seen; while zero, plain keys edit the buffer.
 	native:    usize,
 	/// Keys go to the results grid (selection, copy) instead of the editor.
@@ -381,6 +465,8 @@ impl App {
 			write: false,
 			in_editor: true,
 			picked: None,
+			pop_css: String::new(),
+			rows: pane_rows().unwrap_or(40.0),
 			native: 0,
 			grid_focus: false,
 		};
@@ -600,6 +686,38 @@ impl App {
 		self.new_buffer(sql);
 	}
 
+	/// The database the selected explorer row belongs to.
+	fn picked_db(&self) -> Option<String> {
+		let id = self.picked.as_deref()?;
+		if let Some(db) = id.strip_prefix("db:") {
+			Some(db.to_owned())
+		} else if let Some(rest) = id.strip_prefix("o:") {
+			rest.split(SEP).next().map(str::to_owned)
+		} else {
+			// Folders are `g:<db>:<group>`; the group never holds a colon.
+			id.strip_prefix("g:").and_then(|r| r.rsplit_once(':')).map(|(db, _)| db.to_owned())
+		}
+	}
+
+	/// Runs a database menu item on the selected row's database.
+	fn db_action(&mut self, act: DbAct) {
+		let Some(db) = self.picked_db() else {
+			self.note = "select a database first".into();
+			return;
+		};
+		match act {
+			DbAct::Use => self.activate(&format!("db:{db}")),
+			DbAct::NewQuery => {
+				self.activate(&format!("db:{db}"));
+				self.new_buffer(String::new());
+			},
+			DbAct::Refresh => {
+				self.catalogs.remove(&db);
+				self.ensure_catalog(&db);
+			},
+		}
+	}
+
 	/// Recomputes the completion popup after an edit or on request.
 	fn complete(&mut self, force: bool) {
 		let b = &self.buffers[self.active];
@@ -647,12 +765,17 @@ impl App {
 			.key("tree")
 			.basis(0.24)
 			.grow(0.0)
-			.max(ui::Bound::h(ui::Extent::Fraction(1.0)))
+			.shrink(1.0)
+			.min(ui::Bound::h(ui::Extent::Lines(0.0)))
+			.max(ui::Bound::h(ui::Extent::Lines(self.rows - 3.0)))
 			.on_select(|id| Msg::TreeSel(id.to_owned()))
 			.on_activate(|id| Msg::Activate(id.to_owned()))
 			.on_toggle(|_| Msg::Toggle);
 		for kind in [script::Kind::Select, script::Kind::Insert, script::Kind::Update, script::Kind::Delete, script::Kind::Create] {
 			tree = tree.on_menu(kind.act(), Msg::Script(kind));
+		}
+		for (name, act) in [("New query on database", DbAct::NewQuery), ("Use database", DbAct::Use), ("Refresh database", DbAct::Refresh)] {
+			tree = tree.on_menu(name, Msg::Db(act));
 		}
 		tree.item(srv)
 	}
@@ -868,7 +991,7 @@ impl App {
 			let table = html::table().class("grid").child(html::thead().child(head)).child(html::tbody().children(rows));
 			ui::col().key("body").child(html::div().class("gridwrap").child(table))
 		};
-		ui::col().key("res").max(ui::Bound::h(ui::Extent::Lines(16.0))).child(tabs).child(body)
+		ui::col().key("res").max(ui::Bound::h(ui::Extent::Lines((self.rows * 0.32).round()))).child(tabs).child(body)
 	}
 
 	/// The query tabs and the active buffer's editor.
@@ -889,7 +1012,9 @@ impl App {
 		let editor = ui::editor()
 			.key("ed")
 			.grow(1.0)
-			.min(ui::Bound::h(ui::Extent::Lines(10.0)))
+			.min(ui::Bound::h(ui::Extent::Lines(4.0)))
+			.shrink(1.0)
+			.max(ui::Bound::h(ui::Extent::Lines((self.rows * 0.42).round())))
 			.text(b.text.clone())
 			.cursor(b.cursor)
 			.lang("sql")
@@ -898,35 +1023,48 @@ impl App {
 			.on_edit(|e| Msg::Edit(e.clone()))
 			.on_undo(Msg::Undo)
 			.on_focus(Msg::Focus);
-		ui::col().key("work").grow(1.0).child(tabs).child(editor).child(self.results())
+		let mut col = ui::col().key("work").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).child(tabs);
+		// The popup's anchor has no height and sits at the editor's top edge; the popup is placed from there.
+		if let Some(pop) = self.popup_overlay() {
+			col = col.child(pop);
+		}
+		col.child(editor).child(ui::text(" ").key("gap").max(ui::Bound::h(ui::Extent::Lines(1.0)))).child(self.results())
 	}
 
 
 	/// The completion list, shown in the dock above the status strip.
-	fn popup_view(&self) -> Option<ui::List<Msg>> {
+	fn popup_overlay(&self) -> Option<html::El<Msg>> {
 		let p = self.popup.as_ref()?;
-		let mut list = ui::list().key("comp").max_lines(9).selected(p.sel.to_string()).on_activate(|id| Msg::Pick(id.to_owned()));
-		for (i, it) in p.comp.items.iter().enumerate() {
-			let icon = match it.kind {
-				ItemKind::Column => "tag",
-				ItemKind::Table => "grid",
-				ItemKind::View => "eye",
-				ItemKind::Proc => "code",
-				ItemKind::Func => "braces",
-				ItemKind::Schema => "folder",
-				ItemKind::Database => "database",
-				ItemKind::Keyword => "key-round",
+		let n = p.comp.items.len();
+		// A window of rows that keeps the selection visible.
+		let first = p.sel.saturating_sub(POPUP_ROWS - 1).min(n.saturating_sub(POPUP_ROWS));
+		let rows = p.comp.items.iter().enumerate().skip(first).take(POPUP_ROWS).map(|(i, it)| {
+			let tag = match it.kind {
+				ItemKind::Column => "col",
+				ItemKind::Table => "tbl",
+				ItemKind::View => "view",
+				ItemKind::Proc => "proc",
+				ItemKind::Func => "fn",
+				ItemKind::Schema => "sch",
+				ItemKind::Database => "db",
+				ItemKind::Keyword => "kw",
 			};
-			list = list.child(ui::item(it.label.clone()).key(i).detail(it.detail.clone()).icon(icon));
-		}
-		Some(list)
+			html::div()
+				.class(if i == p.sel { "pi cur" } else { "pi" })
+				.on_click(Msg::Pick(i.to_string()))
+				.child(html::span(tag).class("pk"))
+				.child(html::span(it.label.clone()))
+				.child(html::span(it.detail.clone()).class("pd"))
+		});
+		// Just under the caret's line: left is the gutter plus the column, top the line count.
+		Some(html::div().class("popwrap").child(html::div().class("pop").children(rows)))
 	}
 
 	/// The whole view.
 	fn view(&self) -> View<Msg> {
 		let b = &self.buffers[self.active];
 		let (line, col) = b.line_col();
-		let body = ui::row().key("body").grow(1.0).align(ui::Align::Stretch).child(self.explorer()).child(self.work());
+		let body = ui::row().key("body").grow(1.0).shrink(1.0).min(ui::Bound::h(ui::Extent::Lines(0.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(self.explorer()).child(self.work());
 		let catalog = self.catalog().map_or_else(|| "loading catalog...".to_owned(), |c| format!("{} objects", c.objects.len()));
 		let status = ui::status()
 			.key("bar")
@@ -940,11 +1078,8 @@ impl App {
 					.side(Side::Right)
 					.tone(if self.write { Tone::Warning } else { Tone::Success }),
 			);
-		let main = ui::col().min(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(body);
-		match self.popup_view() {
-			Some(list) => View::new().main(main).dock(nodes![list, status]),
-			None => View::new().main(main).dock(nodes![status]),
-		}
+		let main = ui::col().min(ui::Bound::h(ui::Extent::Fraction(1.0))).max(ui::Bound::h(ui::Extent::Fraction(1.0))).align(ui::Align::Stretch).child(body);
+		View::new().main(main).dock(nodes![status])
 	}
 }
 
@@ -957,7 +1092,13 @@ const GRID_CSS: &str = "\
 .grid td.sel,.grid th.sel{background:color-mix(in srgb,var(--sf-c-accent) 26%,transparent)}\
 .grid td.cur{outline:1px solid var(--sf-c-accent);outline-offset:-1px}\
 .grid td.null{font-style:italic;color:var(--sf-c-muted)}\
-.gridwrap{overflow:auto;max-height:19em;max-height:15lh}";
+.gridwrap{overflow:auto;max-height:19em;max-height:15lh}\
+.popwrap{position:relative;height:0;z-index:30}\
+.pop{position:absolute;margin:10px 0 0 14px;min-width:26ch;max-width:60ch;padding:2px 0;border:1px solid var(--sf-c-muted);border-radius:4px;background:color-mix(in srgb,var(--sf-c-accent) 8%,#15171d);box-shadow:0 4px 14px rgba(0,0,0,.5)}\
+.pi{display:flex;gap:1.2ch;padding:0 8px;white-space:nowrap;cursor:pointer}\
+.pi.cur{background:color-mix(in srgb,var(--sf-c-accent) 30%,transparent)}\
+.pk{color:var(--sf-c-accent);min-width:4ch;font-size:.85em}\
+.pd{color:var(--sf-c-muted);margin-left:auto;padding-left:2ch}";
 
 /// Is shift held in a click event?
 fn shift_held(ev: &Event) -> bool {
@@ -972,7 +1113,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 	let mut app = App::new(db, profile, server, files)?;
 	let sf = session.open(SurfaceOptions::screen().title("SQL Server").role("sqlq"))?;
 	session.stylesheet(sf, "grid", Some(GRID_CSS))?;
-	draw(&mut session, sf, &app)?;
+	draw(&mut session, sf, &mut app)?;
 	session.focus(sf, Some(EDITOR))?;
 	loop {
 		// Poll while jobs run so the clock ticks and replies show up; block when idle.
@@ -985,7 +1126,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		let changed = app.poll();
 		let Some(input) = input else {
 			if changed {
-				draw(&mut session, sf, &app)?;
+				draw(&mut session, sf, &mut app)?;
 			}
 			continue;
 		};
@@ -1044,6 +1185,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				app.popup = None;
 			},
 			Input::Msg(Msg::Focus, _) => {
+				app.rows = pane_rows().unwrap_or(app.rows);
 				app.in_editor = true;
 				app.grid_focus = false;
 				session.focus(sf, Some(EDITOR))?;
@@ -1111,20 +1253,54 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 				session.focus(sf, Some(EDITOR))?;
 			},
 			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
+			Input::Msg(Msg::Db(act), _) => {
+				app.db_action(act);
+				session.focus(sf, Some(EDITOR))?;
+			},
 			Input::Msg(Msg::Script(kind), _) => {
 				app.script_selected(kind);
 				session.focus(sf, Some(EDITOR))?;
 			},
+			Input::Event(Event::Resize(_)) => app.rows = pane_rows().unwrap_or(app.rows),
 			_ => continue,
 		}
-		draw(&mut session, sf, &app)?;
+		draw(&mut session, sf, &mut app)?;
 	}
 	session.close()?;
 	Ok(())
 }
 
 /// Renders the view.
-fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &App) -> anyhow::Result<()> {
+fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> anyhow::Result<()> {
+	// Inline styles are ignored, so the popup's position rides in a stylesheet that is resent when the caret moves.
+	let (line, col) = app.buffers[app.active].line_col();
+	let css = format!(".pop{{top:{:.2}em;left:{:.2}em}}", line as f64 * 1.15, col.saturating_sub(1) as f64 * 0.6);
+	if css != app.pop_css {
+		session.stylesheet(sf, "pop", Some(&css))?;
+		app.pop_css = css;
+	}
 	session.render(sf, app.view())?;
 	Ok(())
+}
+
+/// The pane's height in rows, from `tern inspect --json` (the surface is never told its height).
+fn pane_rows() -> Option<f64> {
+	let id: u64 = std::env::var("TERN_PANE").ok()?.parse().ok()?;
+	let out = std::process::Command::new("tern").args(["inspect", "--json"]).output().ok()?;
+	let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+	let mut found = None;
+	let mut stack = vec![&v];
+	while let Some(n) = stack.pop() {
+		match n {
+			serde_json::Value::Object(m) => {
+				if m.get("id").and_then(serde_json::Value::as_u64) == Some(id) && m.contains_key("rows") {
+					found = m.get("rows").and_then(serde_json::Value::as_f64);
+				}
+				stack.extend(m.values());
+			},
+			serde_json::Value::Array(a) => stack.extend(a),
+			_ => {},
+		}
+	}
+	found.filter(|r| *r >= 12.0)
 }
