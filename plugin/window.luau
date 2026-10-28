@@ -26,13 +26,19 @@ tern.command({
 	group = GROUP,
 	run = function(cx)
 		-- The explorer on the left, an idle editor pane on the right that the explorer fills in.
-		cx.layout:tab({
+		local tab = cx.layout:tab({
 			name = "SQL Server",
 			split = "right",
 			ratio = EXPLORER_SHARE,
 			{ launch = { command = "tern-mssql" } },
 			{ launch = { command = "tern-mssql waiting" } },
 		})
+		-- Focus starts on the explorer (the left leaf), whichever pane Tern picked.
+		local layout = if tab then cx.layout:layout(tab) else nil
+		local left = if layout then layout.root[1] else nil
+		if left and left.pane then
+			cx.layout:focus(left.pane)
+		end
 	end,
 })
 

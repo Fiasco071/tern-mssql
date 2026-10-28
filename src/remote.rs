@@ -137,9 +137,9 @@ fn tern(args: &[&str]) -> Option<String> {
 }
 
 /// Opens `req` in an editor pane for `profile`: an existing one if it is listening, else a new pane to the right of this one.
-pub fn open(profile: &str, req: &Request) -> Result<(), String> {
+pub fn open(profile: &str, req: &Request, focus: bool) -> Result<(), String> {
 	if let Some(pane) = send(profile, req) {
-		if let Some(p) = pane {
+		if let Some(p) = pane.filter(|_| focus) {
 			let _ = tern(&["focus", &p]);
 		}
 		return Ok(());
@@ -162,7 +162,7 @@ pub fn open(profile: &str, req: &Request) -> Result<(), String> {
 	}
 	let refs: Vec<&str> = args.iter().map(String::as_str).collect();
 	let out = tern(&refs).ok_or_else(|| "tern split failed".to_owned())?;
-	if let Some(block) = serde_json::from_str::<serde_json::Value>(&out).ok().and_then(|v| v.get("block").map(ToString::to_string)) {
+	if focus && let Some(block) = serde_json::from_str::<serde_json::Value>(&out).ok().and_then(|v| v.get("block").map(ToString::to_string)) {
 		let _ = tern(&["focus", block.trim_matches('"')]);
 	}
 	Ok(())

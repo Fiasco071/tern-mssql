@@ -816,7 +816,7 @@ impl App {
 			}
 			return;
 		}
-		self.note = match remote::open(&self.profile, &remote::Request { profile: self.profile.clone(), db: db.to_owned(), sql, run }) {
+		self.note = match remote::open(&self.profile, &remote::Request { profile: self.profile.clone(), db: db.to_owned(), sql, run }, true) {
 			Ok(()) => format!("opened in the editor ({db})"),
 			Err(e) => e,
 		};
@@ -1515,8 +1515,11 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		app.ed_focused = false;
 		session.focus(sf, None)?;
 		// An explorer alone is half a screen: open an editor beside it.
-		let db = app.current.clone();
-		app.open_sql(&db, String::new(), false);
+		// Focus stays here: the user just opened the explorer.
+		let first = remote::Request { profile: app.profile.clone(), db: app.current.clone(), ..remote::Request::default() };
+		if let Err(e) = remote::open(&app.profile, &first, false) {
+			app.note = e;
+		}
 		draw(&mut session, sf, &mut app)?;
 	} else {
 		app.ed_focused = true;
