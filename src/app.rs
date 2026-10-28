@@ -64,6 +64,8 @@ enum Msg {
 	Col(usize),
 	/// A row number was clicked.
 	Row(usize),
+	/// Switch the explorer between schema folders and `schema.name` labels.
+	GroupToggle,
 	/// A header's sort arrow was clicked.
 	Sort(usize),
 	/// The corner of the grid was clicked.
@@ -453,6 +455,8 @@ struct App {
 	/// Keys go to the results grid (selection, copy) instead of the editor.
 	grid_focus: bool,
 	role: Role,
+	/// The explorer groups objects in a folder per schema.
+	by_schema: bool,
 	/// An editor's listener and the requests it receives.
 	remote: Option<(remote::Listening, std::sync::mpsc::Receiver<remote::Request>)>,
 }
@@ -517,6 +521,7 @@ impl App {
 			ed_focused: true,
 			grid_focus: false,
 			role: Role::Whole,
+			by_schema: true,
 			remote: None,
 		};
 		app.ensure_catalog(&current);
@@ -937,6 +942,8 @@ impl App {
 				for (name, act) in acts {
 					row = row.on_menu(name, Msg::DbRow(id.clone(), act));
 				}
+			} else if id == "srv" {
+				row = row.on_menu(if self.by_schema { "List objects as schema.name" } else { "Group objects by schema" }, Msg::GroupToggle);
 			} else if id.starts_with("o:") {
 				for kind in [script::Kind::Select, script::Kind::Insert, script::Kind::Update, script::Kind::Delete, script::Kind::Create] {
 					row = row.on_menu(kind.act(), Msg::ScriptRow(id.clone(), kind));
@@ -980,6 +987,7 @@ impl App {
 					self.picked = go(at.map_or(0, |a| a + 1)).or(self.picked.take());
 				}
 			},
+			"g" => self.by_schema = !self.by_schema,
 			"enter" => {
 				if let Some(id) = self.picked.clone() {
 					self.open_row(&id);
@@ -1018,14 +1026,12 @@ impl App {
 			f.icon = Some(if is_open { "folder-open" } else { "folder" }.into());
 			f
 		};
-		let objects = |kind: ObjKind, icon: &'static str| -> Vec<TreeItem> {
-			cat.of(kind)
+		let objects = |kind: ObjKind, icon: &'static str, group: &str| -> Vec<TreeItem> {
+			let mut all: Vec<(String, TreeItem)> = cat
+				.of(kind)
 				.map(|o| {
 					let id = format!("o:{db}{SEP}{}{SEP}{}", o.schema, o.name);
-					let mut label = vec![span(o.name.clone(), "")];
-					if !o.schema.eq_ignore_ascii_case("dbo") {
-						label.push(span(format!("  {}", o.schema), "dim"));
-					}
+					let label = if self.by_schema { vec![span(o.name.clone(), "")] } else { vec![span(format!("{}.", o.schema), "dim"), span(o.name.clone(), "")] };
 					let mut item = TreeItem::new(id.clone(), label).open(self.expanded.contains(&id));
 					item.icon = Some(icon.into());
 					if !o.columns.is_empty() {
@@ -1045,18 +1051,34 @@ impl App {
 							item.children.push(TreeItem::new(format!("p:{id}"), vec![span("...", "dim")]));
 						}
 					}
-					item
+					(o.schema.clone(), item)
 				})
-				.collect()
+				.collect();
+			if !self.by_schema {
+				return all.into_iter().map(|(_, i)| i).collect();
+			}
+			// One folder per schema, dbo first.
+			let mut schemas: Vec<String> = all.iter().map(|(sch, _)| sch.clone()).collect();
+			schemas.sort_by_key(|sch| (!sch.eq_ignore_ascii_case("dbo"), sch.to_lowercase()));
+			schemas.dedup();
+			let mut folders = Vec::new();
+			for sch in schemas {
+				let (mine, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|(o, _)| *o == sch);
+				all = rest;
+				let mut f = folder(&format!("{group}{SEP}{sch}"), &sch, mine.len());
+				f.children = mine.into_iter().map(|(_, i)| i).collect();
+				folders.push(f);
+			}
+			folders
 		};
 		let mut tables = folder("tables", "Tables", cat.of(ObjKind::Table).count());
-		tables.children = objects(ObjKind::Table, "grid");
+		tables.children = objects(ObjKind::Table, "grid", "tables");
 		let mut views = folder("views", "Views", cat.of(ObjKind::View).count());
-		views.children = objects(ObjKind::View, "eye");
+		views.children = objects(ObjKind::View, "eye", "views");
 		let mut procs = folder("procs", "Stored Procedures", cat.of(ObjKind::Proc).count());
-		procs.children = objects(ObjKind::Proc, "code");
+		procs.children = objects(ObjKind::Proc, "code", "procs");
 		let mut funcs = folder("funcs", "Functions", cat.of(ObjKind::Func).count());
-		funcs.children = objects(ObjKind::Func, "braces");
+		funcs.children = objects(ObjKind::Func, "braces", "funcs");
 		let mut prog = folder("prog", "Programmability", cat.of(ObjKind::Proc).count() + cat.of(ObjKind::Func).count());
 		prog.children = vec![procs, funcs];
 		vec![tables, views, prog]
@@ -1717,6 +1739,7 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 				app.ed_focused = true;
 session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
+			Input::Msg(Msg::GroupToggle, _) => app.by_schema = !app.by_schema,
 			Input::Msg(Msg::TreeSel(id), _) => app.picked = Some(id),
 			Input::Msg(Msg::Side(d), _) => app.side = (app.side as i32 + d).clamp(0, SIDES.len() as i32 - 1) as usize,
 			Input::Msg(Msg::DbRow(id, act), _) => {
