@@ -1039,7 +1039,8 @@ impl App {
 		}
 		let q = self.qualify(db, schema, name);
 		let sql = script::generate(kind, obj, &q);
-		self.open_sql(db, sql, false);
+		// A SELECT is safe to run on the spot; the other scripts need their placeholders filled in first.
+		self.open_sql(db, sql, matches!(kind, script::Kind::Select));
 	}
 
 	/// The database the selected explorer row belongs to.
