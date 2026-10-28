@@ -6,6 +6,7 @@ description = "A SQL Server client for Tern, drawn as native Tern surfaces."
 license = "MIT"
 
 [dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tern-sdk = "0.1.0"
 tiberius = { version = "0.12", default-features = false, features = ["rustls", "tds73", "chrono"] }
 tokio = { version = "1", features = ["rt", "net", "sync", "macros"] }

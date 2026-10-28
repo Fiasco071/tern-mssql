@@ -7,6 +7,7 @@ mod backend;
 mod catalog;
 mod clip;
 mod complete;
+mod connect;
 mod guard;
 mod profile;
 mod tsql;
@@ -71,19 +72,9 @@ fn main() -> anyhow::Result<()> {
 			let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
 			app::run(db, (*name).to_owned(), server, &files)
 		},
-		[] => {
-			let profiles = profile::load()?;
-			let rows: Vec<(String, String)> = profiles
-				.iter()
-				.map(|p| (p.name.clone(), format!("{}  {}", p.server, p.user)))
-				.collect();
-			match app::pick(&rows)? {
-				Some(name) => {
-					let (db, server) = connect(&name)?;
-					app::run(db, name, server, &[])
-				},
-				None => Ok(()),
-			}
+		[] => match connect::choose()? {
+			Some((db, name, server)) => app::run(db, name, server, &[]),
+			None => Ok(()),
 		},
 	}
 }
