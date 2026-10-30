@@ -1,34 +1,132 @@
 # tern-mssql
 
-SQL Server client for [Tern](https://stencil.so/tern), in Rust: `tern-sdk` for native surfaces, `tiberius` for TDS. One native binary per OS, no runtime.
+[![build](https://github.com/zachristmas/tern-mssql/actions/workflows/build.yml/badge.svg)](https://github.com/zachristmas/tern-mssql/actions/workflows/build.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![rust 2024](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org)
+[![tern plugin](https://img.shields.io/badge/tern-plugin-6f42c1.svg)](https://stencil.so/tern)
 
-    tern-mssql [PROFILE] [FILE.sql...]   query window (a profile picker if no PROFILE)
-    tern-mssql query PROFILE "SQL"       one batch printed as a table
-    tern-mssql profiles                  list saved profiles
+A SQL Server client that lives inside [Tern](https://stencil.so/tern). Object explorer, T-SQL editor with completion, and a spreadsheet-style results grid, all drawn as native Tern surfaces. It's one Rust binary per OS with no runtime to install.
 
-With no profile named, the connection manager opens: add, edit, delete, test and connect to saved connections, entered as separate fields or as a connection string. Passwords go to the OS credential store (a password in a pasted connection string is stripped out and stored there).
+Built on [`tern-sdk`](https://crates.io/crates/tern-sdk) for the UI and [`tiberius`](https://github.com/prisma/tiberius) for TDS.
 
-Profiles live in `%APPDATA%\tern-mssql\profiles.json` (`~/.config/tern-mssql/profiles.json` elsewhere). The file holds no secret; a profile can instead name the env var that holds the password:
+## Features
 
-    [{ "name": "qas", "server": "host", "user": "sa", "password_env": "QAS_DB_PW", "trust_cert": true }]
-
-## Query window
-
-- Explorer on the left, styled like Tern's file explorer: server, databases (the active one marked), Tables, Views, Programmability, columns under a table with type and key icons. Columns load on expand. Enter or double-click a table to open `SELECT TOP (1000)` in a new tab.
-- Query tabs with a full-height buffer, T-SQL highlighting, undo. Multiple result sets, a Messages tab with SSMS-style errors (`Msg 208, Level 16, State 1, Line 3`), and row counts.
-- Results are a spreadsheet-style grid: click a cell, shift-click to extend, click a column header or a row number to select the whole column or row, arrows and shift+arrows to move and extend, ctrl+a to select all. Ctrl+c copies the selection as tab-separated text (ctrl+shift+c adds the column headers), so it pastes into Excel as cells. NULL copies as an empty cell. In the grid, s sorts by the selected column (again to reverse), / or ctrl+f filters rows, j and i save the current view as JSON or INSERT statements. Esc returns focus to the editor.
-- Script as SELECT, INSERT, UPDATE, DELETE or CREATE from a table or view's menu in the explorer. Script as SELECT runs the statement.
-- The editor session autosaves per launch directory and connection and comes back on the next start.
-- Completion from the active database's catalog (loaded in the background): tables after `FROM`/`JOIN`, columns after `alias.`, databases after `USE`, schemas, functions, keywords. It shows in the dock above the status line.
-
-Opening any database in the tree loads its objects without changing the editor's database; double-click a database to switch to it.
-
-Keys: F5 runs the script (split at `GO`), ctrl+enter runs the statement at the caret, esc cancels, ctrl+space completes (tab or enter accepts, up/down moves), ctrl+e exports the statement's full result to CSV, ctrl+n/ctrl+w new/close tab, ctrl+s saves, F8 toggles write mode, F6 switches explorer/editor, ctrl+q quits.
-
-Read-only is the default. The guard refuses statements that look like writes; it is a seat belt, not a security boundary, so use a read-only login when that matters.
+- Object explorer styled like Tern's file explorer: server, databases, tables, views, programmability, and columns with type and key icons. Objects group by schema (press `g` for a flat list). Columns load on expand, and each database loads its own catalog lazily.
+- Query tabs with T-SQL highlighting, undo, word editing keys, and scripts split at `GO`. Run the whole script or just the statement at the caret, and cancel at any time.
+- Completion from the live catalog: tables after `FROM`/`JOIN`, columns after `alias.`, databases after `USE`, plus schemas, functions and keywords.
+- Results grid that works like a spreadsheet. Select cells, rows or columns, then copy as tab-separated text that pastes straight into Excel. Sort, filter, and save the current view as JSON or `INSERT` statements. Multiple result sets, row counts, and SSMS-style messages (`Msg 208, Level 16, State 1, Line 3`).
+- Script as `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `CREATE` from any table or view.
+- CSV export of a statement's full result, streamed to disk.
+- Connection manager to add, edit, test and delete saved connections, as separate fields or a pasted connection string.
+- Passwords live in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux).
+- Open tabs autosave per launch directory and connection, then come back on the next start.
+- Read-only by default: a guard refuses statements that look like writes until you press `F8`.
+- Split layout with the explorer and editor in separate Tern panes linked over loopback.
 
 ## Install
 
-`cargo install --path .`, then `tern plugin link plugin`. Palette commands: "SQL Server: Open Tab", "Open Beside Current Pane", "New Connection", "Manage Connections". The status line says `native edit` or `key edit` depending on how the terminal delivers typing.
+You need [Tern](https://stencil.so/tern) and a stable Rust toolchain (2024 edition, Rust 1.85 or newer).
 
-Built and tested on Windows; macOS arm64 builds and passes tests (not run against a server). CI builds all three OSes. Not yet built, in this order: query history, execution plans, Entra sign-in, a security explorer (users, roles, permissions), SQL Agent jobs, table designer.
+```sh
+git clone https://github.com/zachristmas/tern-mssql
+cd tern-mssql
+cargo install --path .
+tern plugin link plugin
+```
+
+Then open the Tern command palette:
+
+| Command | What it does |
+|---|---|
+| SQL Server: Open Tab | Opens the client in a new tab |
+| SQL Server: Open Beside Current Pane | Opens it in a split to the right |
+| SQL Server: New Connection | Opens a blank connection form |
+| SQL Server: Manage Connections | Opens the connection manager |
+
+The status line shows `native edit` or `key edit` depending on how the terminal delivers typing.
+
+## Command line
+
+```text
+tern-mssql [PROFILE] [FILE.sql...]   query window (connection manager if no PROFILE)
+tern-mssql --new                     connection manager on a blank form
+tern-mssql query PROFILE "SQL"       run one batch and print it as a table
+tern-mssql profiles                  list saved profiles
+```
+
+## Connections
+
+Saved connections live in `%APPDATA%\tern-mssql\profiles.json` on Windows and `~/.config/tern-mssql/profiles.json` elsewhere. The file holds no secrets. If you paste a connection string with a password in it, the password is stripped out and stored in the credential store.
+
+For scripts and CI, a profile can name an environment variable to read the password from instead:
+
+```json
+[{ "name": "qas", "server": "host", "user": "sa", "password_env": "QAS_DB_PW", "trust_cert": true }]
+```
+
+## Keys
+
+### Editor
+
+| Key | Action |
+|---|---|
+| `F5` | Run the script (split at `GO`) |
+| `Ctrl+Enter` | Run the statement at the caret |
+| `Esc` / `Ctrl+X` | Cancel the running query |
+| `Ctrl+Space` | Complete (`Tab` or `Enter` accepts, arrows move) |
+| `Ctrl+E` | Export the statement's full result to CSV |
+| `Ctrl+N` / `Ctrl+W` | New / close tab |
+| `Ctrl+S` / `Ctrl+Shift+S` | Save / Save As |
+| `F8` | Toggle write mode |
+| `F6` | Switch between explorer and editor |
+| `Alt+Left` / `Alt+Right` | Narrow / widen the explorer |
+| `Ctrl+Q` | Quit |
+
+### Results grid
+
+| Key | Action |
+|---|---|
+| Click, `Shift`+click, arrows, `Shift`+arrows | Select and extend |
+| Column header / row number | Select the whole column / row |
+| `Ctrl+A` | Select all |
+| `Ctrl+C` / `Ctrl+Shift+C` | Copy as TSV / copy with headers |
+| `s` | Sort by the selected column (again to reverse) |
+| `/` or `Ctrl+F` | Filter rows |
+| `j` / `i` | Save the current view as JSON / `INSERT` statements |
+| `Esc` | Reset sort and filter, then back to the editor |
+
+### Explorer
+
+| Key | Action |
+|---|---|
+| Arrows | Move through the tree (`Left` jumps to the parent) |
+| `Enter` / double-click on a table | Open `SELECT TOP (1000)` in a new tab |
+| Double-click on a database | Make it the editor's database |
+| `g` | Toggle grouping by schema |
+
+## A note on safety
+
+Read-only mode is a seat belt. It isn't a security boundary. When it matters, connect with a read-only login.
+
+## Platform support
+
+| OS | Status |
+|---|---|
+| Windows | Built and tested against live servers |
+| macOS (arm64) | Builds and passes tests; not yet run against a server |
+| Linux | Builds and passes tests in CI |
+
+## Roadmap
+
+In rough order:
+
+- [ ] Query history
+- [ ] Execution plans
+- [ ] Microsoft Entra sign-in
+- [ ] Security explorer (users, roles, permissions)
+- [ ] SQL Agent jobs
+- [ ] Table designer
+
+## License
+
+[MIT](LICENSE)
