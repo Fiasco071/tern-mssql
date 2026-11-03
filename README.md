@@ -1,12 +1,21 @@
+<div align="center">
+
 # tern-mssql
+
+**A SQL Server client that lives inside [Tern](https://stencil.so/tern).**
+
+Object explorer, T-SQL editor with completion, and a spreadsheet-style results grid, all drawn as native Tern surfaces. One Rust binary per OS, no runtime to install.
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust 2024](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org)
 [![tern plugin](https://img.shields.io/badge/tern-plugin-6f42c1.svg)](https://stencil.so/tern)
+[![sql server](https://img.shields.io/badge/sql_server-TDS_7.3%2B-cc2927.svg)](https://learn.microsoft.com/sql/sql-server)
 
-A SQL Server client that lives inside [Tern](https://stencil.so/tern). Object explorer, T-SQL editor with completion, and a spreadsheet-style results grid, all drawn as native Tern surfaces. It's one Rust binary per OS with no runtime to install.
+<img src="docs/explorer-results.png" alt="The object explorer with a table's columns expanded, a T-SQL query, and its results in the grid" width="900">
 
-Built on [`tern-sdk`](https://crates.io/crates/tern-sdk) for the UI and [`tiberius`](https://github.com/prisma/tiberius) for TDS.
+</div>
+
+Built on [`tern-sdk`](https://crates.io/crates/tern-sdk) for the UI and [`tiberius`](https://github.com/prisma/tiberius) for TDS. The screenshots show a made-up sample database.
 
 ## Features
 
@@ -21,6 +30,8 @@ Built on [`tern-sdk`](https://crates.io/crates/tern-sdk) for the UI and [`tiberi
 - Open tabs autosave per launch directory and connection, then come back on the next start.
 - Read-only by default: a guard refuses statements that look like writes until you press `F8`.
 - Split layout with the explorer and editor in separate Tern panes linked over loopback.
+
+<p align="center"><img src="docs/completion.png" alt="Column completion after a table alias, with each column's type, nullability and key" width="900"></p>
 
 ## Install
 
@@ -54,6 +65,8 @@ tern-mssql profiles                  list saved profiles
 ```
 
 ## Connections
+
+<p align="center"><img src="docs/connection.png" alt="The connection form: name, server, port, user, a password read from an environment variable, database, and the trust-certificate option" width="900"></p>
 
 Saved connections live in `%APPDATA%\tern-mssql\profiles.json` on Windows and `~/.config/tern-mssql/profiles.json` elsewhere. The file holds no secrets. If you paste a connection string with a password in it, the password is stripped out and stored in the credential store.
 
@@ -125,6 +138,10 @@ In rough order:
 - [ ] Security explorer (users, roles, permissions)
 - [ ] SQL Agent jobs
 - [ ] Table designer
+
+## Related
+
+- [tern-azdo](https://github.com/zachristmas/tern-azdo): Azure DevOps pull requests in Tern, built the same way.
 
 ## License
 
