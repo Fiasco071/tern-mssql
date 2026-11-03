@@ -467,6 +467,8 @@ struct App {
 	cell: (f64, f64),
 	/// The pane's height in rows, which the layout bounds are shares of.
 	rows: f64,
+	/// The pane's width in columns, which keeps the completion list inside the editor.
+	cols: f64,
 	/// Native `edit` events seen; while zero, plain keys edit the buffer.
 	native:    usize,
 	/// Tern's editor is believed to hold keyboard focus (false after any click elsewhere).
@@ -538,6 +540,7 @@ impl App {
 			picked: None,
 			pop_css: String::new(),
 			rows: pane_rows().unwrap_or(40.0),
+			cols: pane_dim("cols").unwrap_or(160.0),
 			epoch: 0,
 			side: 4,
 			cell: (10.0, 20.0),
@@ -1678,6 +1681,22 @@ impl App {
 	}
 
 
+	/// The completion list's likely width in CSS pixels: its widest label and detail, plus the tag column and padding.
+	fn popup_width(&self) -> Option<f64> {
+		let p = self.popup.as_ref()?;
+		let label = p.comp.items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0);
+		let detail = p.comp.items.iter().map(|i| i.detail.chars().count()).max().unwrap_or(0);
+		let char_px = self.cell.0 * CSS_PER_CELL_W;
+		Some(((label + detail) as f64 * char_px + 110.0).clamp(260.0, 600.0))
+	}
+
+	/// The editor's width in CSS pixels: the pane less the explorer and the divider beside it.
+	fn editor_px(&self) -> f64 {
+		let pane = self.cols * self.cell.0 * CSS_PER_CELL_W;
+		let side = if self.role == Role::Whole { SIDES[self.side] + 24.0 } else { 0.0 };
+		pane - side - 24.0
+	}
+
 	/// The completion list, shown in the dock above the status strip.
 	fn popup_overlay(&self) -> Option<html::El<Msg>> {
 		let p = self.popup.as_ref()?;
@@ -1755,9 +1774,10 @@ const GRID_CSS: &str = "\
 .tr{display:flex;align-items:center;gap:6px;height:24px;box-sizing:border-box;padding:0 8px;white-space:nowrap;cursor:pointer;border-radius:4px}\
 .tr:hover{background:color-mix(in srgb,var(--sf-c-muted) 14%,transparent)}\
 .tr.cur{background:color-mix(in srgb,var(--sf-c-accent) 24%,transparent)}\
-.tc{width:12px;color:var(--sf-c-muted);text-align:center}\
-.ti{width:14px;text-align:center;color:var(--sf-c-muted)}\
+.tc{width:12px;flex-shrink:0;color:var(--sf-c-muted);text-align:center}\
+.ti{width:14px;flex-shrink:0;text-align:center;color:var(--sf-c-muted)}\
 .d1{padding-left:20px}.d2{padding-left:34px}.d3{padding-left:48px}.d4{padding-left:62px}.d5{padding-left:76px}\
+.tr span{flex-shrink:0}.tr .s-dim{flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis}\
 .s-strong{font-weight:700}.s-accent{color:var(--sf-c-accent)}.s-dim{color:var(--sf-c-muted)}\
 .vsep{width:24px;align-self:stretch;display:flex;flex-direction:column;align-items:center;gap:10px;padding-top:8px}.vb{width:22px;height:30px;line-height:28px;text-align:center;border-radius:6px;border:1px solid color-mix(in srgb,var(--sf-c-muted) 45%,transparent);color:var(--sf-c-accent);cursor:pointer;font-size:22px}.vb:hover{color:var(--sf-c-accent);background:color-mix(in srgb,var(--sf-c-accent) 18%,transparent)}\
 .grid th{position:sticky;top:0;text-align:left;font-weight:600;padding:2px 14px 2px 8px;white-space:nowrap;cursor:pointer;color:var(--sf-c-muted)}\
@@ -2049,6 +2069,7 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Event(Event::Resize(r)) => {
 				app.rows = pane_rows().unwrap_or(app.rows);
+				app.cols = f64::from(r.cols);
 				if let Some(c) = r.cell {
 					app.cell = (c.w, c.h);
 				}
@@ -2079,10 +2100,15 @@ fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> any
 	// Tern rejects inline styles and ch/lh units, so positions and heights ride in a stylesheet in pixels, resent when they change.
 	let (line, col) = app.buffers[app.active].line_col();
 	let (cw, ch) = app.cell;
+	// Under the caret, but moved left as far as it takes for the list to stay inside the editor.
+	let mut left = col.saturating_sub(1) as f64 * cw * CSS_PER_CELL_W + 12.0;
+	if let Some(w) = app.popup_width() {
+		left = left.min(app.editor_px() - w - 8.0).max(4.0);
+	}
 	let css = format!(
 		".pop{{top:{}px;left:{}px}}.tree{{width:{}}}",
-		line as f64 * ch * CSS_PER_CELL_H + 6.0,
-		col.saturating_sub(1) as f64 * cw * CSS_PER_CELL_W + 12.0,
+		line as f64 * ch * CSS_PER_CELL_H + 10.0,
+		left.round(),
 		if app.role == Role::Explorer { "100%".to_owned() } else { format!("{}px", SIDES[app.side]) }
 	);
 	if css != app.pop_css {
@@ -2095,6 +2121,11 @@ fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> any
 
 /// The pane's height in rows, from `tern inspect --json` (the surface is never told its height).
 fn pane_rows() -> Option<f64> {
+	pane_dim("rows").filter(|r| *r >= 12.0)
+}
+
+/// One of the pane's dimensions (`rows` or `cols`) from `tern inspect --json`.
+fn pane_dim(key: &str) -> Option<f64> {
 	let id: u64 = std::env::var("TERN_PANE").ok()?.parse().ok()?;
 	let out = std::process::Command::new("tern").args(["inspect", "--json"]).output().ok()?;
 	let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
@@ -2103,8 +2134,8 @@ fn pane_rows() -> Option<f64> {
 	while let Some(n) = stack.pop() {
 		match n {
 			serde_json::Value::Object(m) => {
-				if m.get("id").and_then(serde_json::Value::as_u64) == Some(id) && m.contains_key("rows") {
-					found = m.get("rows").and_then(serde_json::Value::as_f64);
+				if m.get("id").and_then(serde_json::Value::as_u64) == Some(id) && m.contains_key(key) {
+					found = m.get(key).and_then(serde_json::Value::as_f64);
 				}
 				stack.extend(m.values());
 			},
@@ -2112,7 +2143,7 @@ fn pane_rows() -> Option<f64> {
 			_ => {},
 		}
 	}
-	found.filter(|r| *r >= 12.0)
+	found
 }
 
 /// A tree label's spans as `(text, style)`.
