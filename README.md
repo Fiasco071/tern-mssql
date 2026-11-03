@@ -1,6 +1,5 @@
 # tern-mssql
 
-[![build](https://github.com/zachristmas/tern-mssql/actions/workflows/build.yml/badge.svg)](https://github.com/zachristmas/tern-mssql/actions/workflows/build.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust 2024](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org)
 [![tern plugin](https://img.shields.io/badge/tern-plugin-6f42c1.svg)](https://stencil.so/tern)
@@ -114,7 +113,7 @@ Read-only mode is a seat belt. It isn't a security boundary. When it matters, co
 |---|---|
 | Windows | Built and tested against live servers |
 | macOS (arm64) | Builds and passes tests; not yet run against a server |
-| Linux | Builds and passes tests in CI |
+| Linux | Should build (CI workflow included); not tested by hand |
 
 ## Roadmap
 
