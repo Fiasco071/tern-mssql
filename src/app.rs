@@ -211,10 +211,21 @@ impl Buffer {
 
 	/// Applies a native edit. False when Tern's text length disagrees with ours.
 	fn apply(&mut self, e: &wire::Edit) -> bool {
-		if e.len != u16_len(&self.text) {
+		self.apply_parts(e.from, e.to, &e.text, e.cursor, e.len)
+	}
+
+	/// [`apply`](Self::apply) from the edit's parts: replace `from..to` (UTF-16) with `text`, caret to `cursor`.
+	fn apply_parts(&mut self, from: usize, to: usize, text: &str, cursor: usize, len: usize) -> bool {
+		if len != u16_len(&self.text) {
 			return false;
 		}
-		let single = e.from == e.to && u16_len(&e.text) == 1 && e.text != "\n";
+		// A click in the editor arrives as an empty edit: only the caret moves.
+		if from == to && text.is_empty() {
+			self.cursor = cursor.min(len);
+			return true;
+		}
+		let single = from == to && u16_len(text) == 1 && text != "
+";
 		if !(single && self.last_single) {
 			self.undo.push((self.text.clone(), self.cursor));
 			if self.undo.len() > 500 {
@@ -222,9 +233,9 @@ impl Buffer {
 			}
 		}
 		self.last_single = single;
-		let (a, b) = (byte_of(&self.text, e.from), byte_of(&self.text, e.to));
-		self.text.replace_range(a.min(b)..b.max(a), &e.text);
-		self.cursor = e.cursor;
+		let (a, b) = (byte_of(&self.text, from), byte_of(&self.text, to));
+		self.text.replace_range(a.min(b)..b.max(a), text);
+		self.cursor = cursor;
 		self.dirty = true;
 		true
 	}
@@ -1901,6 +1912,7 @@ pub fn run<B: Backend + Send + 'static>(db: B, profile: String, server: String, 
 		}
 		match input {
 			Input::Key(key) => {
+				let key = ctrl_from_meta(key);
 				let popup = app.popup.is_some();
 				if app.prompt.is_some() {
 					app.prompt_key(&key);
@@ -1962,7 +1974,11 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 			},
 			Input::Msg(Msg::Edit(e), _) => {
 				app.ed_focused = true;
-				app.native += 1;
+				// Only an edit that changes the text shows Tern edits natively; a caret move from a click does not,
+				// and counting it made the editor drop every typed key afterwards.
+				if e.from != e.to || !e.text.is_empty() {
+					app.native += 1;
+				}
 				if app.buf().apply(&e) {
 					app.complete(false);
 				} else {
@@ -1979,7 +1995,6 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 				app.popup = None;
 			},
 			Input::Msg(Msg::Focus, _) => {
-				app.rows = pane_rows().unwrap_or(app.rows);
 				app.in_editor = true;
 				app.grid_focus = false;
 				app.ed_focused = true;
@@ -2095,6 +2110,15 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 	Ok(())
 }
 
+/// Tern can report Ctrl as meta; off macOS (where meta is Cmd) treat it as Ctrl so word moves and shortcuts work.
+fn ctrl_from_meta(mut key: tern_sdk::keys::Key) -> tern_sdk::keys::Key {
+	if !cfg!(target_os = "macos") && key.meta && !key.ctrl {
+		key.meta = false;
+		key.ctrl = true;
+	}
+	key
+}
+
 /// Renders the view.
 fn draw(session: &mut Session<Msg>, sf: tern_sdk::Surface, app: &mut App) -> anyhow::Result<()> {
 	// Tern rejects inline styles and ch/lh units, so positions and heights ride in a stylesheet in pixels, resent when they change.
@@ -2166,6 +2190,17 @@ fn label_parts(label: &impl serde::Serialize) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_click_moves_the_caret_without_editing() {
+		let mut b = Buffer::new("q.sql".into(), "SELECT 1".into());
+		assert!(b.apply_parts(3, 3, "", 3, 8));
+		assert_eq!((b.text.as_str(), b.cursor, b.dirty, b.undo.len()), ("SELECT 1", 3, false, 0));
+		assert!(b.apply_parts(8, 8, "0", 9, 8));
+		assert_eq!((b.text.as_str(), b.cursor, b.dirty), ("SELECT 10", 9, true));
+		// A length that disagrees means the two copies drifted.
+		assert!(!b.apply_parts(0, 0, "x", 1, 3));
+	}
 
 	#[test]
 	fn unsaved_means_edited_or_never_saved_with_text() {
