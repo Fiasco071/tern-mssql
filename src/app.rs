@@ -1672,6 +1672,7 @@ impl App {
 			.grow(0.0)
 			.min(ui::Bound::h(ui::Extent::Lines(self.editor_lines())))
 			.max(ui::Bound::h(ui::Extent::Lines(self.editor_lines())))
+			.max_lines(self.editor_lines() as u32)
 			.text(b.text.clone())
 			.cursor(b.cursor)
 			.lang("sql")
