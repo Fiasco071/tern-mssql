@@ -17,7 +17,7 @@ use crate::{
 	backend::{Backend, Cancel, Rows},
 	catalog::{Catalog, ObjKind},
 	complete::{self, Completion, ItemKind},
-	guard, remote, script, tsql,
+	clip, guard, remote, script, tsql,
 	worker::{Job, Reply, RunResult, Worker},
 };
 
@@ -185,6 +185,11 @@ fn u16_len(s: &str) -> usize {
 	s.chars().map(char::len_utf16).sum()
 }
 
+/// Pasted text with every line ending as `\n`: Windows puts `\r\n` on the clipboard, and the buffer counts lines by `\n`.
+fn newlines(s: &str) -> String {
+	s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 impl Buffer {
 	fn new(name: String, text: String) -> Self {
 		let cursor = u16_len(&text);
@@ -270,7 +275,7 @@ impl Buffer {
 		match key.name.as_str() {
 			"enter" => self.put("\n"),
 			"tab" => self.put("  "),
-			"paste" => self.put(key.text.as_deref().unwrap_or_default()),
+			"paste" => self.put(&newlines(key.text.as_deref().unwrap_or_default())),
 			"backspace" if key.ctrl && c > 0 => {
 				let from = self.word_before(c);
 				self.cursor -= u16_len(&self.text[from..c]);
@@ -585,6 +590,38 @@ impl App {
 	/// Lines the work area can use: the pane less the status bar.
 	fn avail_lines(&self) -> f64 {
 		self.rows - 4.0
+	}
+
+	/// Puts a paste into the editor: the key's own text (a bracketed paste) or the clipboard (Ctrl+V).
+	/// Tern never pastes into the editor itself, and in native-edit mode it keeps its own copy of the text,
+	/// so a new editor identity makes it take ours. True when the editor must be given the caret again.
+	fn paste(&mut self, key: &tern_sdk::keys::Key) -> bool {
+		let text = if key.name == "paste" {
+			key.text.clone().unwrap_or_default()
+		} else {
+			match clip::get() {
+				Ok(text) => text,
+				Err(e) => {
+					self.note = format!("paste failed: {e}");
+					return false;
+				},
+			}
+		};
+		if text.is_empty() {
+			return false;
+		}
+		let was_focused = self.ed_focused && self.in_editor;
+		let paste = tern_sdk::keys::Key { name: "paste".into(), text: Some(text), ..Default::default() };
+		self.buf().key(&paste);
+		let retake = self.native > 0 && was_focused;
+		if retake {
+			self.epoch += 1;
+			self.popup = None;
+		}
+		self.in_editor = true;
+		self.ed_focused = true;
+		self.complete(false);
+		retake || !was_focused
 	}
 
 	/// Lines the prompt bar takes from the editor.
@@ -1961,6 +1998,10 @@ session.focus(sf, Some(app.editor_id().as_str()))?;
 					let id = app.editor_id();
 					app.ed_focused = app.in_editor;
 					session.focus(sf, app.in_editor.then_some(id.as_str()))?;
+				} else if !app.grid_focus && (key.name == "paste" || key.is("ctrl+v")) {
+					if app.paste(&key) {
+						session.focus(sf, Some(app.editor_id().as_str()))?;
+					}
 				} else if !app.in_editor && !app.grid_focus {
 					app.tree_key(&key);
 				} else if (app.native == 0 || !app.ed_focused) && !app.grid_focus && app.buf().key(&key) {
@@ -2200,6 +2241,17 @@ mod tests {
 		assert_eq!((b.text.as_str(), b.cursor, b.dirty), ("SELECT 10", 9, true));
 		// A length that disagrees means the two copies drifted.
 		assert!(!b.apply_parts(0, 0, "x", 1, 3));
+	}
+
+	#[test]
+	fn a_paste_is_one_undo_step_with_unix_line_endings() {
+		let mut b = Buffer::new("q.sql".into(), "SELECT 1".into());
+		b.cursor = 8;
+		let paste = tern_sdk::keys::Key { name: "paste".into(), text: Some("\r\n-- a\r\n-- b\r".into()), ..Default::default() };
+		assert!(b.key(&paste));
+		assert_eq!((b.text.as_str(), b.cursor, b.undo.len()), ("SELECT 1\n-- a\n-- b\n", 19, 1));
+		b.undo();
+		assert_eq!((b.text.as_str(), b.cursor), ("SELECT 1", 8));
 	}
 
 	#[test]

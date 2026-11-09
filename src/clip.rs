@@ -21,6 +21,44 @@ fn pipe(mut cmd: Command, bytes: &[u8]) -> anyhow::Result<()> {
 	Ok(())
 }
 
+/// Runs `cmd` and returns what it prints.
+#[cfg(not(windows))]
+fn read(mut cmd: Command) -> anyhow::Result<String> {
+	let out = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output()?;
+	if !out.status.success() {
+		bail!("{:?} failed", cmd.get_program());
+	}
+	Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The clipboard's text, empty when it holds no text.
+pub fn get() -> anyhow::Result<String> {
+	#[cfg(windows)]
+	{
+		if !clipboard_win::raw::is_format_avail(clipboard_win::formats::CF_UNICODETEXT) {
+			return Ok(String::new());
+		}
+		clipboard_win::get_clipboard_string().map_err(|e| anyhow::anyhow!("{e}"))
+	}
+	#[cfg(target_os = "macos")]
+	{
+		read(Command::new("pbpaste"))
+	}
+	#[cfg(all(unix, not(target_os = "macos")))]
+	{
+		let candidates: [(&str, &[&str]); 3] =
+			[("wl-paste", &["--no-newline"]), ("xclip", &["-selection", "clipboard", "-o"]), ("xsel", &["--clipboard", "--output"])];
+		for (prog, args) in candidates {
+			let mut cmd = Command::new(prog);
+			cmd.args(args);
+			if let Ok(text) = read(cmd) {
+				return Ok(text);
+			}
+		}
+		bail!("no clipboard tool found (install wl-clipboard, xclip or xsel)")
+	}
+}
+
 /// Puts `text` on the clipboard.
 pub fn set(text: &str) -> anyhow::Result<()> {
 	#[cfg(windows)]
