@@ -83,7 +83,7 @@ For scripts and CI, a profile can name an environment variable to read the passw
 | Key | Action |
 |---|---|
 | `F5` | Run the script (split at `GO`) |
-| `Ctrl+Enter` | Run the statement at the caret |
+| `Ctrl+Enter` | Run the statement at the caret (highlighting does not change what runs; an empty spot runs nothing and says so) |
 | `Esc` / `Ctrl+X` | Cancel the running query |
 | `Ctrl+Space` | Complete (`Tab` or `Enter` accepts, arrows move) |
 | `Ctrl+E` | Export the statement's full result to CSV |

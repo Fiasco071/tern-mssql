@@ -937,6 +937,13 @@ impl App {
 	fn run_statement(&mut self) {
 		let b = &self.buffers[self.active];
 		let s = tsql::statement_at(&b.text, b.cursor_byte()).to_owned();
+		// Tern does not report the selection, so Ctrl+Enter after a select-all lands after the last statement:
+		// running that empty text only prints "Commands completed successfully" and looks like a dead connection.
+		if !tsql::has_code(&s) {
+			self.popup = None;
+			self.note = "nothing to run at the caret: put it inside a statement, or F5 runs the whole script".into();
+			return;
+		}
 		self.run(vec![s]);
 	}
 
