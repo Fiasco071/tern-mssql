@@ -86,6 +86,7 @@ For scripts and CI, a profile can name an environment variable to read the passw
 | `Ctrl+Enter` | Run the statement at the caret |
 | `Esc` / `Ctrl+X` | Cancel the running query |
 | `Ctrl+Space` | Complete (`Tab` or `Enter` accepts, arrows move) |
+| `Ctrl+V` | Paste at the caret (line endings become `\n`) |
 | `Ctrl+E` | Export the statement's full result to CSV |
 | `Ctrl+N` / `Ctrl+W` | New / close tab |
 | `Ctrl+S` / `Ctrl+Shift+S` | Save / Save As |
