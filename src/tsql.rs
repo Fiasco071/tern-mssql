@@ -239,6 +239,12 @@ pub fn batches(src: &str) -> Vec<String> {
 	out
 }
 
+/// Whether `src` holds anything SQL Server would do: not just comments, `GO` lines and semicolons.
+pub fn has_code(src: &str) -> bool {
+	let toks = lex(src);
+	toks.iter().enumerate().any(|(i, t)| t.kind != Kind::Comment && !(t.kind == Kind::Punct && t.text(src) == ";") && !is_go(src, &toks, i))
+}
+
 /// The trimmed statement around `cursor` (a byte offset): bounded by `;`, `GO` lines and blank lines.
 pub fn statement_at(src: &str, cursor: usize) -> &str {
 	let (a, b) = statement_range(src, cursor);
@@ -282,6 +288,22 @@ pub fn statement_range(src: &str, cursor: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn only_code_counts_as_something_to_run() {
+		assert!(has_code("SELECT 1"));
+		assert!(has_code("-- note
+SELECT 1;"));
+		assert!(!has_code(""));
+		assert!(!has_code("   
+"));
+		assert!(!has_code("-- a comment
+/* and another */"));
+		assert!(!has_code("GO"));
+		assert!(!has_code(";
+GO
+"));
+	}
 
 	#[test]
 	fn lexes_tsql_pieces() {
